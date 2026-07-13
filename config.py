@@ -40,12 +40,12 @@ else:
 # ==========================================
 class Config:
     # Архитектура
-    input_dim = 384          # BGE-Small embedding dim
-    hidden_dim = 256         # Внутренняя размерность
-    embed_dim = 128          # Выходная размерность JEPA
+    input_dim = 1024          # BGE-Small embedding dim
+    hidden_dim = 512         # Внутренняя размерность
+    embed_dim = 512          # Выходная размерность JEPA
     num_layers = 2           # Слои Transformer Encoder
     nhead = 4                # Количество голов внимания
-    max_seq_len = 128        # Максимальная длина последовательности
+    max_seq_len = 256        # Максимальная длина последовательности
     
     # Обучение
     batch_size = 512         # Увеличено для GPU (12GB VRAM)
@@ -72,7 +72,7 @@ class Config:
     log_interval = 50
     
     # Пути
-    model_path = "./bge-small-en-v1.5-onnx-Q"
+    model_path = "./bge-large-en-v1.5-onnx"
     checkpoint_dir = "./checkpoints"
     shards_dir = "./shards"
     

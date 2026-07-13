@@ -29,7 +29,7 @@ from dataset import ShardedEmbeddingsDataset
 # КОНСТАНТЫ
 # ==========================================
 HF_REPO_ID = "vasil646/jepa_text"
-MODEL_PATH = "./bge-small-en-v1.5-onnx-Q"
+MODEL_PATH = "./bge-large-en-v1.5-onnx"
 CHECKPOINTS_DIR = "./checkpoints"
 SHARDS_DIR = "./shards"
 
@@ -48,7 +48,7 @@ def ensure_base_model_available():
         snapshot_download(
             repo_id=HF_REPO_ID,
             local_dir="./",
-            allow_patterns=["bge-small-en-v1.5-onnx-Q/*"]
+            allow_patterns=["./bge-large-en-v1.5-onnx/*"]
         )
         # Перемещаем model.onnx в корень (если он в подпапке onnx/)
         onnx_subdir = Path(MODEL_PATH) / "onnx" / "model.onnx"
@@ -58,7 +58,7 @@ def ensure_base_model_available():
     except Exception as e:
         print(f"⚠️  Не удалось скачать с вашего репозитория: {e}")
         print(f"📥 Fallback: скачиваю Xenova/bge-small-en-v1.5...")
-        snapshot_download(repo_id="Xenova/bge-small-en-v1.5", local_dir=MODEL_PATH)
+        snapshot_download(repo_id="Xenova/bge-large-en-v1.5", local_dir=MODEL_PATH)
         onnx_subdir = Path(MODEL_PATH) / "onnx" / "model.onnx"
         if onnx_subdir.exists() and not (Path(MODEL_PATH) / "model.onnx").exists():
             shutil.move(str(onnx_subdir), str(Path(MODEL_PATH) / "model.onnx"))
@@ -503,3 +503,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

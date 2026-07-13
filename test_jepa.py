@@ -22,7 +22,7 @@ from config import Config, DEVICE, NUM_CORES
 # ==========================================
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 HF_REPO_ID = "vasil646/jepa_text"
-MODEL_PATH = "./bge-small-en-v1.5-onnx-Q"
+MODEL_PATH = "./bge-large-en-v1.5-onnx"
 CHECKPOINTS_DIR = "./checkpoints"
 
 # ==========================================
@@ -35,13 +35,13 @@ def ensure_base_model():
     print(f"📥 Базовая модель не найдена. Скачиваю с HF Hub...")
     from huggingface_hub import snapshot_download
     try:
-        snapshot_download(repo_id=HF_REPO_ID, local_dir="./", allow_patterns=["bge-small-en-v1.5-onnx-Q/*"])
+        snapshot_download(repo_id=HF_REPO_ID, local_dir="./", allow_patterns=["bge-large-en-v1.5-onnx/*"])
         onnx_sub = Path(MODEL_PATH) / "onnx" / "model.onnx"
         if onnx_sub.exists():
             import shutil
             shutil.move(str(onnx_sub), str(Path(MODEL_PATH) / "model.onnx"))
     except Exception:
-        snapshot_download(repo_id="Xenova/bge-small-en-v1.5", local_dir=MODEL_PATH)
+        snapshot_download(repo_id="Xenova/bge-large-en-v1.5", local_dir=MODEL_PATH)
         onnx_sub = Path(MODEL_PATH) / "onnx" / "model.onnx"
         if onnx_sub.exists():
             import shutil
