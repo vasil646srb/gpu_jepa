@@ -1,5 +1,6 @@
 """
 🚀 Streaming обучение Text-JEPA
+- Строгое пофайловое скачивание данных (не загружает весь датасет сразу)
 - ONNX Runtime на GPU для предвычисления BGE-эмбеддингов
 - PyTorch на GPU для обучения JEPA
 - Streaming pipeline: скачивание → инференс → обучение → удаление
@@ -55,12 +56,9 @@ def ensure_base_model_available():
             shutil.move(str(onnx_subdir), str(Path(MODEL_PATH) / "model.onnx"))
         print(f"✅ Базовая модель загружена в {MODEL_PATH}")
     except Exception as e:
-        print(f"⚠️  Не удалось скачать с HF: {e}")
+        print(f"⚠️  Не удалось скачать с вашего репозитория: {e}")
         print(f"📥 Fallback: скачиваю Xenova/bge-small-en-v1.5...")
-        snapshot_download(
-            repo_id="Xenova/bge-small-en-v1.5",
-            local_dir=MODEL_PATH
-        )
+        snapshot_download(repo_id="Xenova/bge-small-en-v1.5", local_dir=MODEL_PATH)
         onnx_subdir = Path(MODEL_PATH) / "onnx" / "model.onnx"
         if onnx_subdir.exists() and not (Path(MODEL_PATH) / "model.onnx").exists():
             shutil.move(str(onnx_subdir), str(Path(MODEL_PATH) / "model.onnx"))
@@ -70,14 +68,10 @@ def ensure_base_model_available():
 # ONNX INFERENCE С ПОДДЕРЖКОЙ GPU
 # ==========================================
 def create_onnx_session(model_path):
-    """
-    Создает ONNX сессию с автоматическим выбором GPU/CPU.
-    При наличии GPU использует CUDAExecutionProvider для ускорения.
-    """
+    """Создает ONNX сессию с автоматическим выбором GPU/CPU."""
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     
-    # Определяем провайдеры
     available_providers = ort.get_available_providers()
     
     if DEVICE.type == "cuda" and "CUDAExecutionProvider" in available_providers:
@@ -99,7 +93,6 @@ def create_onnx_session(model_path):
         sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         print(f"💻 ONNX Runtime: CPUExecutionProvider (CPU для эмбеддингов)")
     
-    # Находим ONNX файл
     onnx_files = sorted([f for f in os.listdir(model_path) if f.endswith('.onnx')])
     if not onnx_files:
         raise FileNotFoundError(f"ONNX файлы не найдены в {model_path}")
@@ -113,10 +106,7 @@ def create_onnx_session(model_path):
 
 
 def compute_embeddings_batch(session, expected_inputs, tokenizer, texts, max_length=128):
-    """
-    Вычисляет BGE-эмбеддинги для батча текстов.
-    Автоматически использует GPU если ONNX сессия создана с CUDAExecutionProvider.
-    """
+    """Вычисляет BGE-эмбеддинги для батча текстов на том устройстве, где создана сессия."""
     inputs = tokenizer(
         texts, padding=True, truncation=True,
         max_length=max_length, return_tensors="np"
@@ -132,7 +122,6 @@ def compute_embeddings_batch(session, expected_inputs, tokenizer, texts, max_len
         else:
             ort_inputs["token_type_ids"] = np.zeros_like(inputs["input_ids"], dtype=np.int64)
     
-    # Инференс на том устройстве, на котором создана сессия (GPU или CPU)
     outputs = session.run(None, ort_inputs)
     
     embeddings = torch.tensor(outputs[0], dtype=torch.float32)
@@ -146,7 +135,7 @@ def compute_embeddings_batch(session, expected_inputs, tokenizer, texts, max_len
 # ЭТАП 1: ПРЕДВЫЧИСЛЕНИЕ ЭМБЕДДИНГОВ
 # ==========================================
 def precompute_shard(parquet_path, config, session, expected_inputs, tokenizer, shard_idx):
-    """Предвычисляет эмбеддинги из parquet и сохраняет в шард (на GPU если доступно)."""
+    """Предвычисляет эмбеддинги из parquet и сохраняет в шард."""
     import pyarrow.parquet as pq
     
     print(f"\n🔧 Предвычисление эмбеддингов ({'GPU' if DEVICE.type == 'cuda' else 'CPU'})...")
@@ -246,13 +235,12 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
         
         # Forward pass
         with torch.no_grad():
-            # target_repr: [batch, seq_len, embed_dim]
+            # ВАЖНО: target_repr идет первым, pooled вторым
             target_repr, _ = target_encoder(x, key_padding_mask)
         
         context_repr, _ = encoder(x_masked, key_padding_mask)
         
         # Predictor получает индексы замаскированных позиций
-        # Возвращает: [batch, num_masked, embed_dim]
         predicted_repr = predictor(context_repr, masked_indices)
         
         # Собираем target для тех же индексов через gather
@@ -290,7 +278,6 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
             mask_pct = mask_bool.float().mean().item() * 100
             lr = optimizer.param_groups[0]['lr']
             
-            # GPU статистика
             gpu_info = ""
             if DEVICE.type == "cuda":
                 try:
@@ -298,7 +285,7 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
                     mem_used = torch.cuda.memory_allocated() / 1e9
                     mem_total = torch.cuda.get_device_properties(0).total_memory / 1e9
                     gpu_info = f" | GPU={util}% VRAM={mem_used:.1f}/{mem_total:.1f}GB"
-                except:
+                except Exception:
                     pass
             
             print(f"[Shard {shard_idx} | Step {global_step}] 📊 LR: {lr:.2e}")
@@ -413,45 +400,45 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
     else:
         print("\n🆕 Обучение с нуля")
     
-    # Поиск parquet файлов
-    print("\n🔍 Поиск parquet-файлов в HuggingFaceFW/fineweb-edu...")
-    parquet_files = []
-    for i in range(num_files):
-        try:
-            path = hf_hub_download(
-                repo_id="HuggingFaceFW/fineweb-edu",
-                filename=f"sample/100BT/{i:03d}_00000.parquet",
-                repo_type="dataset",
-                force_download=False
-            )
-            parquet_files.append(path)
-        except Exception:
-            continue
-    
-    if not parquet_files:
-        print(f"❌ Не удалось скачать parquet файлы")
-        sys.exit(1)
-    
-    parquet_files = parquet_files[:num_files]
-    print(f"✅ Найдено файлов: {len(parquet_files)}")
+    # ==========================================
+    # ГЕНЕРАЦИЯ СПИСКА ФАЙЛОВ (БЕЗ СКАЧИВАНИЯ)
+    # ==========================================
+    print("\n🔍 Подготовка списка parquet-файлов HuggingFaceFW/fineweb-edu...")
+    parquet_filenames = [f"sample/100BT/{i:03d}_00000.parquet" for i in range(num_files)]
+    print(f"✅ Будет обработано файлов: {len(parquet_filenames)}")
     
     # Создание директорий
     os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
     os.makedirs(SHARDS_DIR, exist_ok=True)
     
-    # Основной цикл
-    for file_idx in range(start_file_idx, len(parquet_files)):
-        parquet_path = parquet_files[file_idx]
+    # ==========================================
+    # ОСНОВНОЙ ЦИКЛ (СКАЧИВАНИЕ ПО ОДНОМУ)
+    # ==========================================
+    for file_idx in range(start_file_idx, len(parquet_filenames)):
+        parquet_filename = parquet_filenames[file_idx]
+        
+        # ⬇️ СКАЧИВАЕМ ТОЛЬКО ОДИН ФАЙЛ ПЕРЕД ОБРАБОТКОЙ
+        try:
+            parquet_path = hf_hub_download(
+                repo_id=config.dataset_name,
+                filename=parquet_filename,
+                repo_type="dataset",
+                force_download=False
+            )
+        except Exception as e:
+            print(f"⚠️  Не удалось скачать {parquet_filename}: {e}")
+            continue
+        
         print(f"\n{'='*70}")
-        print(f"📥 ФАЙЛ {file_idx+1}/{len(parquet_files)}: {Path(parquet_path).name}")
+        print(f"📥 ФАЙЛ {file_idx+1}/{len(parquet_filenames)}: {Path(parquet_path).name}")
         print(f"{'='*70}")
         
-        # Предвычисление
+        # Предвычисление эмбеддингов
         shard_path, mask_path = precompute_shard(
             parquet_path, config, session, expected_inputs, tokenizer, file_idx
         )
         
-        # Обучение
+        # Обучение на шарде
         print(f"\n📚 Загрузка шарда {file_idx}...")
         global_step = train_on_shard(
             shard_path, mask_path, encoder, predictor, target_encoder,
@@ -478,7 +465,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
             os.remove(shard_path)
             os.remove(mask_path)
             print(f"   🗑  Шард удален (освобождено место)")
-        except:
+        except Exception:
             pass
         
         if config.delete_parquet_after and Path(parquet_path).exists():
@@ -486,7 +473,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
                 size_gb = Path(parquet_path).stat().st_size / 1e9
                 os.remove(parquet_path)
                 print(f"   🗑  Parquet удален (освобождено {size_gb:.2f} GB)")
-            except:
+            except Exception:
                 pass
         
         print(f"\n✅ Файл {file_idx+1} полностью обработан")
