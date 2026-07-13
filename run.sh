@@ -45,11 +45,11 @@ else
 fi
 
 # Скачивание модели BGE
-if [ ! -f "./bge-small-en-v1.5-onnx-Q/model.onnx" ]; then
+if [ ! -f "./bge-small-en-v1.5-onnx/model.onnx" ]; then
     echo "📥 Скачивание BGE..."
-    huggingface-cli download Xenova/bge-small-en-v1.5 --local-dir ./bge-small-en-v1.5-onnx-Q
-    [ -f "./bge-small-en-v1.5-onnx-Q/onnx/model.onnx" ] && \
-        mv ./bge-small-en-v1.5-onnx-Q/onnx/model.onnx ./bge-small-en-v1.5-onnx-Q/model.onnx
+    hf download Xenova/bge-large-en-v1.5 --local-dir ./Xenova/bge-large-en-v1.5
+    [ -f "./Xenova/bge-large-en-v1.5/onnx/model.onnx" ] && \
+        mv ./Xenova/bge-large-en-v1.5/onnx/model.onnx ./Xenova/bge-large-en-v1.5/model.onnx
 fi
 
 echo ""
