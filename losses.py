@@ -1,0 +1,137 @@
+"""
+VICReg Loss и функции маскирования для Text-JEPA
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+
+class VICRegLoss(nn.Module):
+    """
+    VICReg: Variance-Invariance-Covariance Regularization.
+    Предотвращает коллапс представлений в self-supervised learning.
+    """
+    
+    def __init__(self, mse_weight=10.0, var_weight=1.0, cov_weight=0.1, gamma=1.0):
+        super().__init__()
+        self.mse_weight = mse_weight
+        self.var_weight = var_weight
+        self.cov_weight = cov_weight
+        self.gamma = gamma
+    
+    def forward(self, x, y):
+        """
+        Args:
+            x: [N, D] - предсказанные представления
+            y: [N, D] - целевые представления
+        
+        Returns:
+            total_loss, mse_loss, var_loss, cov_loss
+        """
+        N, D = x.shape
+        
+        # 1. Invariance (MSE) - предсказание должно совпадать с целью
+        mse_loss = F.mse_loss(x, y)
+        
+        # 2. Variance - каждое измерение должно иметь достаточную дисперсию
+        std_x = torch.sqrt(x.var(dim=0) + 1e-4)
+        std_y = torch.sqrt(y.var(dim=0) + 1e-4)
+        var_loss = (F.relu(self.gamma - std_x).mean() + 
+                    F.relu(self.gamma - std_y).mean()) / 2
+        
+        # 3. Covariance - измерения должны быть независимыми
+        x_centered = x - x.mean(dim=0)
+        y_centered = y - y.mean(dim=0)
+        cov_x = (x_centered.T @ x_centered) / (N - 1)
+        cov_y = (y_centered.T @ y_centered) / (N - 1)
+        
+        # Обнуляем диагональ (дисперсию)
+        diag_mask = torch.eye(D, device=x.device, dtype=torch.bool)
+        cov_x = cov_x.masked_fill(diag_mask, 0.0)
+        cov_y = cov_y.masked_fill(diag_mask, 0.0)
+        
+        cov_loss = (cov_x.pow(2).sum() + cov_y.pow(2).sum()) / D
+        
+        # Общий loss
+        total_loss = (self.mse_weight * mse_loss + 
+                      self.var_weight * var_loss + 
+                      self.cov_weight * cov_loss)
+        
+        return total_loss, mse_loss, var_loss, cov_loss
+
+
+def compute_mask_indices(shape, key_padding_mask, num_mask_blocks, block_size_range):
+    """
+    Генерирует индексы замаскированных токенов с ФИКСИРОВАННЫМ размером для всего батча.
+    Это критически важно для правильной работы predictor'а.
+    
+    Args:
+        shape: (batch_size, seq_len)
+        key_padding_mask: [batch, seq_len] - True для padding токенов
+        num_mask_blocks: количество блоков для маскирования
+        block_size_range: (min_ratio, max_ratio) размера блока
+    
+    Returns:
+        masked_indices: [batch, num_masked] - LongTensor индексов замаскированных позиций
+        mask_bool: [batch, seq_len] - булева маска
+    """
+    batch_size, seq_len = shape
+    device = key_padding_mask.device
+    
+    # Определяем размер блока и общее число маскируемых токенов
+    min_ratio, max_ratio = block_size_range
+    block_size = int(np.random.uniform(min_ratio, max_ratio) * seq_len)
+    block_size = max(1, min(block_size, seq_len // max(1, num_mask_blocks)))
+    num_masked = num_mask_blocks * block_size
+    num_masked = min(num_masked, seq_len - 1)
+    
+    masked_indices = torch.zeros(batch_size, num_masked, dtype=torch.long, device=device)
+    mask_bool = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
+    
+    for b in range(batch_size):
+        # Валидные позиции (не padding)
+        valid_positions = torch.where(~key_padding_mask[b])[0]
+        
+        if len(valid_positions) <= num_masked:
+            # Если пример слишком короткий, повторяем позиции
+            if len(valid_positions) == 0:
+                chosen = torch.zeros(num_masked, dtype=torch.long, device=device)
+            else:
+                repeats = (num_masked // len(valid_positions)) + 1
+                chosen = valid_positions.repeat(repeats)[:num_masked]
+        else:
+            # Выбираем num_mask_blocks случайных блоков
+            chosen = []
+            available = valid_positions.tolist()
+            
+            for _ in range(num_mask_blocks):
+                if len(available) < block_size:
+                    chosen.extend(available)
+                    break
+                
+                max_start = len(available) - block_size
+                start_idx = np.random.randint(0, max_start + 1)
+                block = available[start_idx:start_idx + block_size]
+                chosen.extend(block)
+                
+                # Удаляем использованные позиции
+                available = available[:start_idx] + available[start_idx + block_size:]
+            
+            # Дополняем до num_masked если нужно
+            if len(chosen) < num_masked:
+                chosen.extend([chosen[0]] * (num_masked - len(chosen)))
+            
+            chosen = torch.tensor(chosen[:num_masked], dtype=torch.long, device=device)
+        
+        masked_indices[b] = chosen
+        mask_bool[b, chosen] = True
+    
+    return masked_indices, mask_bool
+
+
+def update_ema(model, model_ema, tau):
+    """Обновляет параметры EMA (Exponential Moving Average) модели."""
+    with torch.no_grad():
+        for p, p_ema in zip(model.parameters(), model_ema.parameters()):
+            p_ema.data.mul_(tau).add_(p.data, alpha=1 - tau)
