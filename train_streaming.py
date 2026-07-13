@@ -482,6 +482,24 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
     print("🎉 STREAMING ОБУЧЕНИЕ ЗАВЕРШЕНО!")
     print(f"{'='*70}")
 
+def find_latest_checkpoint():
+    """Находит последний чекпоинт или скачивает с HF Hub."""
+    ckpt_dir = Path(CHECKPOINTS_DIR)
+    if ckpt_dir.exists():
+        checkpoints = sorted(ckpt_dir.glob("jepa_shard_*.pt"))
+        if checkpoints:
+            return str(checkpoints[-1])
+    
+    print(f"📥 Локальные чекпоинты не найдены. Скачиваю с HF Hub...")
+    from huggingface_hub import snapshot_download
+    try:
+        snapshot_download(repo_id=HF_REPO_ID, local_dir="./", allow_patterns=["checkpoints/*.pt"])
+        checkpoints = sorted(Path(CHECKPOINTS_DIR).glob("jepa_shard_*.pt"))
+        if checkpoints:
+            return str(checkpoints[-1])
+    except Exception as e:
+        print(f"❌ Не удалось скачать чекпоинты: {e}")
+    return None
 
 # ==========================================
 # MAIN
@@ -491,7 +509,7 @@ def main():
     parser.add_argument("--num-files", type=int, default=10)
     parser.add_argument("--examples-per-file", type=int, default=5000)
     parser.add_argument("--steps-per-shard", type=int, default=500)
-    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=find_latest_checkpoint())
     args = parser.parse_args()
     
     config = Config()
