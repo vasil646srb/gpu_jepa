@@ -97,7 +97,28 @@ def main():
     print(f"\n🧪 Тест 4: Ловушка отрицания")
     print(f"   Схожесть: {s4:.3f} (Ожидается: < 0.75)")
     print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель чувствует инверсию смысла)' if s4 < 0.75 else '❌ ПРОВАЛ (Отрицание проигнорировано)'}")
-    
+
+    # Тест 5
+    t5a = "The engineer refactored the legacy codebase, removing redundant loops and fixing the race condition that caused intermittent crashes."
+    t5b = "The engineer introduced a race condition into the codebase by adding redundant loops, causing the application to crash intermittently."
+    e5 = get_emb([t5a, t5b], encoder, tokenizer, sess, config)
+    s5 = sim(e5[0], e5[1])
+    print(f"\n🧪 Тест 5: Программирование (Исправление бага vs внесение бага)")
+    print(f"   Схожесть: {s5:.3f} (Ожидается: < 0.65)")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель различает fix и bug при почти одинаковой лексике)' if s5 < 0.65 else '❌ ПРОВАЛ (Модель не различает исправление и внесение бага)'}")
+
+    # Тест 6
+    q6 = "Has the project plan been successfully implemented on schedule?"
+    d6_good = "The team completed all milestones of the roadmap ahead of deadline and deployed the final release to production."
+    d6_bad = "The project plan outlines the milestones, deliverables, and timeline for the upcoming quarter."
+    e6 = get_emb([q6, d6_good, d6_bad], encoder, tokenizer, sess, config)
+    s6_good = sim(e6[0], e6[1])
+    s6_bad = sim(e6[0], e6[2])
+    print(f"\n🧪 Тест 6: Реализация плана проекта (План vs Факт исполнения)")
+    print(f"   Запрос -> Отчёт о реализации: {s6_good:.3f}")
+    print(f"   Запрос -> Просто описание плана: {s6_bad:.3f}")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель отличает выполненный план от просто описания плана)' if s6_good > s6_bad else '❌ ПРОВАЛ (Модель не различает стадию планирования и стадию реализации)'}")
+
     print("\n" + "="*60)
 
 if __name__ == "__main__":
