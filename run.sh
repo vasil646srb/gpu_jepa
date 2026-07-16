@@ -32,14 +32,14 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 $SUDO apt-get update -qq
-$SUDO apt-get install -y -qq git python3-pip python3-venv build-essential screen nvtop 2>/dev/null || true
+$SUDO apt-get install -y git python3-pip python3-venv build-essential screen nvtop 2>/dev/null || true
 
 # ==========================================
 # Venv
 # ==========================================
 [ ! -d ".venv" ] && python3 -m venv .venv
 source .venv/bin/activate
-pip install --upgrade pip -q
+pip install --upgrade pip
 
 # ==========================================
 # PyTorch
@@ -48,7 +48,7 @@ pip install --upgrade pip -q
 # ==========================================
 if [ "$GPU_AVAILABLE" = true ]; then
     echo "📦 Установка PyTorch (CUDA 12.8, для Blackwell/RTX 50xx)..."
-    pip install torch --index-url https://download.pytorch.org/whl/cu128 -q
+    pip install torch
 else
     echo "📦 Установка PyTorch (CPU)..."
     pip install torch --index-url https://download.pytorch.org/whl/cpu -q
@@ -68,7 +68,7 @@ PYEOF
 # ML-библиотеки (только реально используемые в коде)
 # ==========================================
 echo "📦 Установка ML-библиотек..."
-pip install -q numpy transformers huggingface_hub pyarrow
+pip install numpy transformers huggingface_hub pyarrow
 
 if [ "$GPU_AVAILABLE" = true ]; then
     pip uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true
