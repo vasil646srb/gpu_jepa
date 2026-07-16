@@ -193,6 +193,14 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
     predictor.train()
     target_encoder.eval()
     
+    # === AMP (Mixed Precision) ===
+    # bfloat16 - лучший выбор для RTX 3090 + VICReg (не нужен GradScaler)
+    use_amp = (DEVICE.type == "cuda")
+    amp_dtype = torch.bfloat16
+    autocast_ctx = torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp)
+    if use_amp:
+        print(f"   🔥 AMP активирован: {amp_dtype}")
+    
     steps_per_shard = config.steps_per_shard
     step_time_acc = 0.0
     data_time_acc = 0.0
@@ -233,28 +241,24 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
         step_start = time.time()
         data_time_acc += step_start - data_start
         
-        # Forward pass
-        with torch.no_grad():
-            # ВАЖНО: target_repr идет первым, pooled вторым
-            target_repr, _ = target_encoder(x, key_padding_mask)
-        
-        context_repr, _ = encoder(x_masked, key_padding_mask)
-        
-        # Predictor получает индексы замаскированных позиций
-        predicted_repr = predictor(context_repr, masked_indices)
-        
-        # Собираем target для тех же индексов через gather
-        idx_expanded = masked_indices.unsqueeze(-1).expand(-1, -1, target_repr.size(-1))
-        target_masked = target_repr.gather(1, idx_expanded)
-        
-        # Приводим к виду [N, D] для VICReg
-        target_masked = target_masked.reshape(-1, target_repr.size(-1))
-        predicted_masked = predicted_repr.reshape(-1, predicted_repr.size(-1))
-        
-        # Loss
-        total_loss, mse_loss, var_loss, cov_loss = vicreg_loss(
-            predicted_masked, target_masked
-        )
+        # Forward pass (с AMP если доступно)
+        with autocast_ctx:
+            with torch.no_grad():
+                target_repr, _ = target_encoder(x, key_padding_mask)
+            
+            context_repr, _ = encoder(x_masked, key_padding_mask)
+            predicted_repr = predictor(context_repr, masked_indices)
+            
+            idx_expanded = masked_indices.unsqueeze(-1).expand(-1, -1, target_repr.size(-1))
+            target_masked = target_repr.gather(1, idx_expanded)
+            
+            target_masked = target_masked.reshape(-1, target_repr.size(-1))
+            predicted_masked = predicted_repr.reshape(-1, predicted_repr.size(-1))
+            
+            # Loss ВСЕГДА считаем в fp32 для стабильности VICReg!
+            total_loss, mse_loss, var_loss, cov_loss = vicreg_loss(
+                predicted_masked.float(), target_masked.float()
+            )
         
         # Backward pass
         optimizer.zero_grad()
