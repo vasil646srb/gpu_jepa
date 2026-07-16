@@ -84,6 +84,7 @@ class EmbeddingEngine:
             device=self.device,
             trust_remote_code=True
         )
+        self.model.max_seq_length = 256
         self.type = "sentence"
         print(f"   🎯 Backend: Sentence-Transformers")
     
@@ -92,13 +93,13 @@ class EmbeddingEngine:
         test_emb = self.encode(["test sentence"], batch_size=1)
         return test_emb.shape[1]
     
-    def encode(self, texts, batch_size=8):
+    def encode(self, texts, batch_size=8, max_length=None, **kwargs):
         all_embs = []
         
         # Получаем доступ к токенизатору и базовой модели трансформера (без пулинг-слоя)
         tokenizer = self.model.tokenizer
         transformer = self.model[0].auto_model # self.model[0] - это сам Transformer
-        max_len = getattr(self.model, 'max_seq_length', 128)
+        max_len = max_length if max_length is not None else getattr(self.model, 'max_seq_length', 128)
         
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i:i+batch_size]
