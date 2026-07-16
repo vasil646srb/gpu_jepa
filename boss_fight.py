@@ -50,7 +50,7 @@ def get_emb(texts, encoder, tokenizer, transformer, max_len, config):
     # Получаем эмбеддинги токенов (last_hidden_state)
     with torch.no_grad():
         outputs = transformer(**inputs)
-        x = outputs.last_hidden_state
+        x = outputs.last_hidden_state.float()
         
     # Маска паддинга (True там, где паддинг, как требует key_padding_mask в PyTorch)
     mask = (inputs["attention_mask"] == 0)

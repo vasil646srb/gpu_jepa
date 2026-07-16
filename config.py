@@ -9,6 +9,7 @@ import multiprocessing
 # ==========================================
 # НАСТРОЙКИ ОКРУЖЕНИЯ
 # ==========================================
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_ETAG_TIMEOUT"] = "500"
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "500"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -43,12 +44,12 @@ class Config:
     input_dim = 1024          # BGE-Small embedding dim
     hidden_dim = 512         # Внутренняя размерность
     embed_dim = 512          # Выходная размерность JEPA
-    num_layers = 2           # Слои Transformer Encoder
-    nhead = 4                # Количество голов внимания
-    max_seq_len = 256        # Максимальная длина последовательности
+    num_layers = 8           # Слои Transformer Encoder
+    nhead = 8                # Количество голов внимания
+    max_seq_len = 32        # Максимальная длина последовательности
     
     # Обучение
-    batch_size = 512         # Увеличено для GPU (12GB VRAM)
+    batch_size = 256         # Увеличено для GPU (12GB VRAM)
     learning_rate = 3e-4
     total_steps = 50000
     warmup_steps = 1000
@@ -72,12 +73,12 @@ class Config:
     log_interval = 50
     
     # Пути
-    model_path = "./bge-large-en-v1.5-onnx"
+    model_path = "Qwen/Qwen3-Embedding-0.6B"
     checkpoint_dir = "./checkpoints"
     shards_dir = "./shards"
     
     # Параметры загрузки
-    parquet_batch_size = 200
+    parquet_batch_size = 2000
     shard_size = 10000
     num_files_to_process = 10
     examples_per_file = 10000
@@ -96,3 +97,4 @@ if __name__ == "__main__":
     print(f"   embed_dim: {c.embed_dim}")
     print(f"   hidden_dim: {c.hidden_dim}")
     print(f"   num_layers: {c.num_layers}")
+
