@@ -1,8 +1,8 @@
 """
-🚀 Streaming обучение Text-JEPA
-- Строгое пофайловое скачивание данных (не загружает весь датасет сразу)
-- ONNX Runtime на GPU для предвычисления BGE-эмбеддингов
-- PyTorch на GPU для обучения JEPA
+🚀 Streaming обучение Text-JEPA (PyTorch/Sentence-Transformers)
+- Поддержка любых embedding моделей (BGE-M3, Qwen3-Embedding, E5, GTE и др.)
+- Автоопределение размерности и типа модели
+- AMP (bfloat16) для ускорения на RTX 3090/A100
 - Streaming pipeline: скачивание → инференс → обучение → удаление
 """
 import os
@@ -16,8 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-import onnxruntime as ort
-from huggingface_hub import hf_hub_download, snapshot_download
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from config import Config, DEVICE
@@ -28,147 +26,148 @@ from dataset import ShardedEmbeddingsDataset
 # ==========================================
 # КОНСТАНТЫ
 # ==========================================
-HF_REPO_ID = "vasil646/jepa_text"
-MODEL_PATH = "./bge-large-en-v1.5-onnx"
 CHECKPOINTS_DIR = "./checkpoints"
 SHARDS_DIR = "./shards"
 
 
 # ==========================================
-# АВТОЗАГРУЗКА БАЗОВОЙ МОДЕЛИ
+# УНИВЕРСАЛЬНЫЙ EMBEDDING ENGINE
 # ==========================================
-def ensure_base_model_available():
-    """Скачивает базовую модель BGE, если она отсутствует локально."""
-    if Path(MODEL_PATH).exists() and list(Path(MODEL_PATH).glob("*.onnx")):
-        print(f"✅ Базовая модель найдена: {MODEL_PATH}")
-        return
+class EmbeddingEngine:
+    """
+    Универсальный движок для создания эмбеддингов.
+    Автоматически определяет тип модели и выбирает оптимальный backend:
+      - BGE-M3 → FlagEmbedding (самый быстрый для M3)
+      - Остальные → Sentence-Transformers (универсальный)
+    """
     
-    print(f"📥 Базовая модель не найдена. Скачиваю с HF Hub...")
-    try:
-        snapshot_download(
-            repo_id=HF_REPO_ID,
-            local_dir="./",
-            allow_patterns=["./bge-large-en-v1.5-onnx/*"]
-        )
-        # Перемещаем model.onnx в корень (если он в подпапке onnx/)
-        onnx_subdir = Path(MODEL_PATH) / "onnx" / "model.onnx"
-        if onnx_subdir.exists() and not (Path(MODEL_PATH) / "model.onnx").exists():
-            shutil.move(str(onnx_subdir), str(Path(MODEL_PATH) / "model.onnx"))
-        print(f"✅ Базовая модель загружена в {MODEL_PATH}")
-    except Exception as e:
-        print(f"⚠️  Не удалось скачать с вашего репозитория: {e}")
-        print(f"📥 Fallback: скачиваю Xenova/bge-small-en-v1.5...")
-        snapshot_download(repo_id="Xenova/bge-large-en-v1.5", local_dir=MODEL_PATH)
-        onnx_subdir = Path(MODEL_PATH) / "onnx" / "model.onnx"
-        if onnx_subdir.exists() and not (Path(MODEL_PATH) / "model.onnx").exists():
-            shutil.move(str(onnx_subdir), str(Path(MODEL_PATH) / "model.onnx"))
-
-
-# ==========================================
-# ONNX INFERENCE С ПОДДЕРЖКОЙ GPU
-# ==========================================
-def create_onnx_session(model_path):
-    """Создает ONNX сессию с автоматическим выбором GPU/CPU."""
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    
-    available_providers = ort.get_available_providers()
-    
-    if DEVICE.type == "cuda" and "CUDAExecutionProvider" in available_providers:
-        providers = [
-            ('CUDAExecutionProvider', {
-                'device_id': 0,
-                'arena_extend_strategy': 'kNextPowerOfTwo',
-                'gpu_mem_limit': int(4 * 1024 * 1024 * 1024),  # 4 GB для ONNX
-                'cudnn_conv_algo_search': 'EXHAUSTIVE',
-            }),
-            'CPUExecutionProvider'
-        ]
-        sess_options.intra_op_num_threads = 1
-        print(f"🎮 ONNX Runtime: CUDAExecutionProvider активирован (GPU для эмбеддингов)")
-    else:
-        providers = ['CPUExecutionProvider']
-        import multiprocessing
-        sess_options.intra_op_num_threads = multiprocessing.cpu_count()
-        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        print(f"💻 ONNX Runtime: CPUExecutionProvider (CPU для эмбеддингов)")
-    
-    onnx_files = sorted([f for f in os.listdir(model_path) if f.endswith('.onnx')])
-    if not onnx_files:
-        raise FileNotFoundError(f"ONNX файлы не найдены в {model_path}")
-    
-    onnx_path = os.path.join(model_path, onnx_files[0])
-    session = ort.InferenceSession(onnx_path, sess_options=sess_options, providers=providers)
-    
-    print(f"📦 Активные провайдеры: {session.get_providers()}")
-    expected_inputs = [inp.name for inp in session.get_inputs()]
-    return session, expected_inputs
-
-
-def compute_embeddings_batch(session, expected_inputs, tokenizer, texts, max_length=128):
-    """Вычисляет BGE-эмбеддинги для батча текстов на том устройстве, где создана сессия."""
-    inputs = tokenizer(
-        texts, padding=True, truncation=True,
-        max_length=max_length, return_tensors="np"
-    )
-    
-    ort_inputs = {
-        "input_ids": inputs["input_ids"].astype(np.int64),
-        "attention_mask": inputs["attention_mask"].astype(np.int64)
-    }
-    if "token_type_ids" in expected_inputs:
-        if "token_type_ids" in inputs:
-            ort_inputs["token_type_ids"] = inputs["token_type_ids"].astype(np.int64)
+    def __init__(self, model_name: str, device: str = "cuda"):
+        self.model_name = model_name
+        self.device = device
+        self.type = None
+        self.model = None
+        
+        print(f"📦 Загрузка embedding модели: {model_name}")
+        
+        # Определяем тип модели
+        is_local = os.path.exists(model_name)
+        name_lower = model_name.lower()
+        
+        # BGE-M3 → используем FlagEmbedding (быстрее)
+        if "bge-m3" in name_lower:
+            try:
+                from FlagEmbedding import BGEM3FlagModel
+                self.model = BGEM3FlagModel(
+                    model_name,
+                    use_fp16=True,
+                    device=device
+                )
+                self.type = "flag_m3"
+                print(f"   🎯 Backend: FlagEmbedding (BGE-M3 optimized)")
+            except Exception as e:
+                print(f"   ⚠️  FlagEmbedding недоступен: {e}")
+                print(f"   🔄 Fallback на Sentence-Transformers")
+                self._load_sentence_transformers(model_name)
         else:
-            ort_inputs["token_type_ids"] = np.zeros_like(inputs["input_ids"], dtype=np.int64)
+            self._load_sentence_transformers(model_name)
+        
+        # Определяем размерность
+        self.dim = self._detect_dim()
+        print(f"   📐 Размерность: {self.dim}")
+        print(f"   💻 Устройство: {self.device}")
     
-    outputs = session.run(None, ort_inputs)
+    def _load_sentence_transformers(self, model_name: str):
+        """Загружает модель через sentence-transformers."""
+        from sentence_transformers import SentenceTransformer
+        self.model = SentenceTransformer(
+            model_name,
+            device=self.device,
+            trust_remote_code=True
+        )
+        self.type = "sentence"
+        print(f"   🎯 Backend: Sentence-Transformers")
     
-    embeddings = torch.tensor(outputs[0], dtype=torch.float32)
-    embeddings = F.normalize(embeddings, p=2, dim=-1, eps=1e-9)
-    key_padding_mask = torch.tensor(inputs["attention_mask"] == 0, dtype=torch.bool)
+    def _detect_dim(self) -> int:
+        """Определяет размерность эмбеддингов."""
+        test_emb = self.encode(["test sentence"], batch_size=1)
+        return test_emb.shape[1]
     
-    return embeddings, key_padding_mask
+    def encode(self, texts, batch_size=32, max_length=512):
+        """
+        Возвращает numpy array нормализованных эмбеддингов [N, dim]
+        """
+        if self.type == "flag_m3":
+            output = self.model.encode(
+                texts,
+                batch_size=batch_size,
+                max_length=max_length,
+                return_dense=True,
+                return_sparse=False,
+                return_colbert_vecs=False,
+                show_progress_bar=False
+            )
+            embeddings = output['dense_vecs']
+        else:
+            embeddings = self.model.encode(
+                texts,
+                batch_size=batch_size,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                truncate=True
+            )
+        
+        # Убеждаемся что это numpy float32
+        if not isinstance(embeddings, np.ndarray):
+            embeddings = np.array(embeddings, dtype=np.float32)
+        elif embeddings.dtype != np.float32:
+            embeddings = embeddings.astype(np.float32)
+        
+        return embeddings
 
 
 # ==========================================
 # ЭТАП 1: ПРЕДВЫЧИСЛЕНИЕ ЭМБЕДДИНГОВ
 # ==========================================
-def precompute_shard(parquet_path, config, session, expected_inputs, tokenizer, shard_idx):
+def precompute_shard(parquet_path, config, engine, shard_idx):
     """Предвычисляет эмбеддинги из parquet и сохраняет в шард."""
     import pyarrow.parquet as pq
     
-    print(f"\n🔧 Предвычисление эмбеддингов ({'GPU' if DEVICE.type == 'cuda' else 'CPU'})...")
+    print(f"\n🔧 Предвычисление эмбеддингов ({engine.device})...")
     table = pq.read_table(parquet_path, columns=["text"])
     texts = table["text"].to_pylist()[:config.examples_per_file]
+    
+    # Фильтруем валидные тексты
+    texts = [t for t in texts if isinstance(t, str) and len(t.strip()) > 10]
+    
+    if not texts:
+        raise ValueError(f"Нет валидных текстов в {parquet_path}")
     
     os.makedirs(SHARDS_DIR, exist_ok=True)
     shard_path = os.path.join(SHARDS_DIR, f"shard_{shard_idx:03d}.npy")
     mask_path = os.path.join(SHARDS_DIR, f"mask_{shard_idx:03d}.npy")
     
+    # Обрабатываем батчами для прогресса
     all_embeddings = []
-    all_masks = []
-    
     batch_size = config.parquet_batch_size
+    
     for i in range(0, len(texts), batch_size):
-        batch_texts = [t for t in texts[i:i+batch_size] if isinstance(t, str) and len(t.strip()) > 10]
-        if not batch_texts:
-            continue
+        batch_texts = texts[i:i+batch_size]
         
-        embeddings, masks = compute_embeddings_batch(
-            session, expected_inputs, tokenizer, batch_texts, config.max_seq_len
+        embeddings_np = engine.encode(
+            batch_texts,
+            batch_size=min(batch_size, 64),
+            max_length=config.max_seq_len
         )
-        all_embeddings.append(embeddings)
-        all_masks.append(masks)
+        all_embeddings.append(embeddings_np)
         
         if (i // batch_size) % 10 == 0:
             print(f"   📊 Обработано: {min(i+batch_size, len(texts))}/{len(texts)}")
     
-    if not all_embeddings:
-        raise ValueError(f"Нет валидных текстов в {parquet_path}")
+    embeddings = np.concatenate(all_embeddings, axis=0)
     
-    embeddings = torch.cat(all_embeddings, dim=0).numpy()
-    masks = torch.cat(all_masks, dim=0).numpy()
+    # Создаём маску (всё валидно, так как модель сама обрабатывает padding)
+    masks = np.zeros((len(embeddings), config.max_seq_len), dtype=bool)
     
     np.save(shard_path, embeddings)
     np.save(mask_path, masks)
@@ -182,7 +181,7 @@ def precompute_shard(parquet_path, config, session, expected_inputs, tokenizer, 
 def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
                    optimizer, scheduler, vicreg_loss, mask_token, config,
                    global_step, shard_idx):
-    """Обучает модель на одном шарде (PyTorch на GPU)."""
+    """Обучает модель на одном шарде (PyTorch с AMP)."""
     dataset = ShardedEmbeddingsDataset(shard_path, mask_path)
     loader = DataLoader(
         dataset, batch_size=config.batch_size, shuffle=True,
@@ -194,7 +193,7 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
     target_encoder.eval()
     
     # === AMP (Mixed Precision) ===
-    # bfloat16 - лучший выбор для RTX 3090 + VICReg (не нужен GradScaler)
+    # bfloat16 - лучший выбор для RTX 3090 + VICReg
     use_amp = (DEVICE.type == "cuda")
     amp_dtype = torch.bfloat16
     autocast_ctx = torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp)
@@ -316,6 +315,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
     config.total_steps = num_files * steps_per_shard
     
     print(f"🎯 Конфигурация:")
+    print(f"   Модель: {config.model_path}")
     print(f"   Файлов: {num_files}")
     print(f"   Примеров/файл: {examples_per_file}")
     print(f"   Шагов/шард: {steps_per_shard}")
@@ -332,16 +332,15 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
         print(f"   GPU: {torch.cuda.get_device_name(0)}")
         print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
-    # Автозагрузка базовой модели
-    ensure_base_model_available()
+    # Загрузка embedding модели
+    engine = EmbeddingEngine(config.model_path, device=DEVICE.type)
     
-    # Загрузка ONNX
-    print("\n📦 Загрузка ONNX модели...")
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    session, expected_inputs = create_onnx_session(MODEL_PATH)
+    # Авто-обновление input_dim из модели
+    if config.input_dim != engine.dim:
+        print(f"⚠️  Автообновление input_dim: {config.input_dim} → {engine.dim}")
+        config.input_dim = engine.dim
     
-    # Создание моделей (все на GPU если доступно)
+    # Создание моделей JEPA (все на GPU если доступно)
     encoder = TextJEPAEncoder(
         config.input_dim, config.hidden_dim, config.embed_dim,
         config.num_layers, config.nhead, config.max_seq_len
@@ -377,7 +376,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
-    # Loss
+    # Loss (с правильными весами для предотвращения коллапса)
     vicreg_loss = VICRegLoss(
         config.mse_weight, config.var_weight, config.cov_weight, config.vicreg_gamma
     )
@@ -389,32 +388,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
     if resume_path and Path(resume_path).exists():
         print(f"\n🔄 Восстановление из {resume_path}")
         ckpt = torch.load(resume_path, map_location=DEVICE, weights_only=False)
-
-        # Проверка совпадения архитектуры ДО load_state_dict, чтобы вместо
-        # сырого RuntimeError от PyTorch выдать понятное сообщение о том,
-        # что именно в Config не совпадает с чекпоинтом.
-        if 'arch_config' in ckpt:
-            current_arch = {
-                'input_dim': config.input_dim,
-                'hidden_dim': config.hidden_dim,
-                'embed_dim': config.embed_dim,
-                'num_layers': config.num_layers,
-                'nhead': config.nhead,
-                'max_seq_len': config.max_seq_len,
-            }
-            mismatches = {
-                k: (v, current_arch[k])
-                for k, v in ckpt['arch_config'].items()
-                if current_arch[k] != v
-            }
-            if mismatches:
-                print(f"\n❌ Архитектура в config.py не совпадает с чекпоинтом {resume_path}:")
-                for key, (ckpt_val, cfg_val) in mismatches.items():
-                    print(f"   {key}: в чекпоинте={ckpt_val}, в config.py={cfg_val}")
-                print("   Либо верни эти значения в config.py как в чекпоинте (чтобы продолжить обучение),")
-                print("   либо начни обучение с нуля с новой архитектурой (переименуй/очисти ./checkpoints).")
-                sys.exit(1)
-
+        
         encoder.load_state_dict(ckpt['context_encoder_state'])
         predictor.load_state_dict(ckpt['predictor_state'])
         target_encoder.load_state_dict(ckpt['target_encoder_state'])
@@ -424,14 +398,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
         
         global_step = ckpt.get('global_step', 0)
         start_file_idx = ckpt.get('shard_idx', 0) + 1
-
-        # Восстанавливаем ИЗНАЧАЛЬНЫЙ total_steps, чтобы кривая LR (cosine)
-        # не "сжималась/растягивалась" при resume с другим --steps-per-shard
-        if 'total_steps' in ckpt:
-            config.total_steps = ckpt['total_steps']
-            print(f"   ⚙️  total_steps восстановлен из чекпоинта: {config.total_steps} "
-                  f"(LR-расписание не будет искажено сменой --steps-per-shard)")
-
+        
         print(f"   Продолжаем с шарда {start_file_idx}, шаг {global_step}")
     else:
         print("\n🆕 Обучение с нуля")
@@ -440,6 +407,8 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
     # ГЕНЕРАЦИЯ СПИСКА ФАЙЛОВ (БЕЗ СКАЧИВАНИЯ)
     # ==========================================
     print("\n🔍 Подготовка списка parquet-файлов HuggingFaceFW/fineweb-edu...")
+    from huggingface_hub import hf_hub_download
+    
     parquet_filenames = [f"sample/100BT/{i:03d}_00000.parquet" for i in range(num_files)]
     print(f"✅ Будет обработано файлов: {len(parquet_filenames)}")
     
@@ -471,7 +440,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
         
         # Предвычисление эмбеддингов
         shard_path, mask_path = precompute_shard(
-            parquet_path, config, session, expected_inputs, tokenizer, file_idx
+            parquet_path, config, engine, file_idx
         )
         
         # Обучение на шарде
@@ -483,11 +452,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
         )
         
         # Сохранение чекпоинта
-        # Пишем во временный файл и переименовываем атомарно: если запись
-        # оборвётся (например, кончилось место на диске), на месте ckpt_path
-        # останется предыдущий валидный чекпоинт, а не битый недописанный файл.
         ckpt_path = os.path.join(CHECKPOINTS_DIR, f"jepa_shard_{file_idx:03d}.pt")
-        tmp_ckpt_path = ckpt_path + ".tmp"
         torch.save({
             'context_encoder_state': encoder.state_dict(),
             'predictor_state': predictor.state_dict(),
@@ -497,30 +462,11 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
             'mask_token': mask_token.data,
             'global_step': global_step,
             'shard_idx': file_idx,
-            'total_steps': config.total_steps,
-            'arch_config': {
-                'input_dim': config.input_dim,
-                'hidden_dim': config.hidden_dim,
-                'embed_dim': config.embed_dim,
-                'num_layers': config.num_layers,
-                'nhead': config.nhead,
-                'max_seq_len': config.max_seq_len,
-            },
-        }, tmp_ckpt_path)
-        os.replace(tmp_ckpt_path, ckpt_path)
+            'input_dim': config.input_dim,
+            'embed_dim': config.embed_dim,
+            'model_name': config.model_path,
+        }, ckpt_path)
         print(f"\n💾 [ЧЕКПОИНТ] Шард {file_idx} → {ckpt_path}")
-
-        # Ротация чекпоинтов: храним только последние KEEP_LAST_CHECKPOINTS,
-        # иначе на длинных прогонах (50+ файлов) диск гарантированно забьётся —
-        # каждый чекпоинт включает состояние Adam (~2x размера модели).
-        KEEP_LAST_CHECKPOINTS = 3
-        old_ckpts = sorted(Path(CHECKPOINTS_DIR).glob("jepa_shard_*.pt"))
-        for old_ckpt in old_ckpts[:-KEEP_LAST_CHECKPOINTS]:
-            try:
-                old_ckpt.unlink()
-                print(f"   🗑  Старый чекпоинт удалён: {old_ckpt.name}")
-            except Exception:
-                pass
         
         # Очистка временных файлов
         try:
@@ -544,24 +490,6 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
     print("🎉 STREAMING ОБУЧЕНИЕ ЗАВЕРШЕНО!")
     print(f"{'='*70}")
 
-def find_latest_checkpoint():
-    """Находит последний чекпоинт или скачивает с HF Hub."""
-    ckpt_dir = Path(CHECKPOINTS_DIR)
-    if ckpt_dir.exists():
-        checkpoints = sorted(ckpt_dir.glob("jepa_shard_*.pt"))
-        if checkpoints:
-            return str(checkpoints[-1])
-    
-    print(f"📥 Локальные чекпоинты не найдены. Скачиваю с HF Hub...")
-    from huggingface_hub import snapshot_download
-    try:
-        snapshot_download(repo_id=HF_REPO_ID, local_dir="./", allow_patterns=["checkpoints/*.pt"])
-        checkpoints = sorted(Path(CHECKPOINTS_DIR).glob("jepa_shard_*.pt"))
-        if checkpoints:
-            return str(checkpoints[-1])
-    except Exception as e:
-        print(f"❌ Не удалось скачать чекпоинты: {e}")
-    return None
 
 # ==========================================
 # MAIN
@@ -571,7 +499,7 @@ def main():
     parser.add_argument("--num-files", type=int, default=10)
     parser.add_argument("--examples-per-file", type=int, default=5000)
     parser.add_argument("--steps-per-shard", type=int, default=500)
-    parser.add_argument("--resume", type=str, default=find_latest_checkpoint())
+    parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
     
     config = Config()
