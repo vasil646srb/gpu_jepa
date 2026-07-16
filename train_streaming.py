@@ -92,38 +92,38 @@ class EmbeddingEngine:
         test_emb = self.encode(["test sentence"], batch_size=1)
         return test_emb.shape[1]
     
-    def encode(self, texts, batch_size=32, max_length=512):
-        """
-        Возвращает numpy array нормализованных эмбеддингов [N, dim]
-        """
-        if self.type == "flag_m3":
-            output = self.model.encode(
-                texts,
-                batch_size=batch_size,
-                max_length=max_length,
-                return_dense=True,
-                return_sparse=False,
-                return_colbert_vecs=False,
-                show_progress_bar=False
-            )
-            embeddings = output['dense_vecs']
-        else:
-            embeddings = self.model.encode(
-                texts,
-                batch_size=batch_size,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                truncate=True
-            )
+    def encode(self, texts, batch_size=8):
+        all_embs = []
         
-        # Убеждаемся что это numpy float32
-        if not isinstance(embeddings, np.ndarray):
-            embeddings = np.array(embeddings, dtype=np.float32)
-        elif embeddings.dtype != np.float32:
-            embeddings = embeddings.astype(np.float32)
+        # Получаем доступ к токенизатору и базовой модели трансформера (без пулинг-слоя)
+        tokenizer = self.model.tokenizer
+        transformer = self.model[0].auto_model # self.model[0] - это сам Transformer
+        max_len = getattr(self.model, 'max_seq_length', 128)
         
-        return embeddings
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i+batch_size]
+            
+            # Токенизируем с паддингом до фиксированной длины max_len
+            inputs = tokenizer(
+                batch_texts,
+                padding='max_length',
+                truncation=True,
+                max_length=max_len,
+                return_tensors="pt"
+            )
+            # Переносим тензоры на GPU/CPU
+            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+            
+            with torch.no_grad():
+                # Прогоняем через трансформер. 
+                # outputs.last_hidden_state имеет форму (batch, seq_len, hidden_dim)
+                outputs = transformer(**inputs)
+                embs = outputs.last_hidden_state
+                
+                all_embs.append(embs.cpu())
+                
+        # Склеиваем батчи. Итоговая форма: (num_texts, seq_len, hidden_dim)
+        return torch.cat(all_embs, dim=0).float().numpy()
 
 
 # ==========================================
