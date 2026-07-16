@@ -385,7 +385,32 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
     if resume_path and Path(resume_path).exists():
         print(f"\n🔄 Восстановление из {resume_path}")
         ckpt = torch.load(resume_path, map_location=DEVICE, weights_only=False)
-        
+
+        # Проверка совпадения архитектуры ДО load_state_dict, чтобы вместо
+        # сырого RuntimeError от PyTorch выдать понятное сообщение о том,
+        # что именно в Config не совпадает с чекпоинтом.
+        if 'arch_config' in ckpt:
+            current_arch = {
+                'input_dim': config.input_dim,
+                'hidden_dim': config.hidden_dim,
+                'embed_dim': config.embed_dim,
+                'num_layers': config.num_layers,
+                'nhead': config.nhead,
+                'max_seq_len': config.max_seq_len,
+            }
+            mismatches = {
+                k: (v, current_arch[k])
+                for k, v in ckpt['arch_config'].items()
+                if current_arch[k] != v
+            }
+            if mismatches:
+                print(f"\n❌ Архитектура в config.py не совпадает с чекпоинтом {resume_path}:")
+                for key, (ckpt_val, cfg_val) in mismatches.items():
+                    print(f"   {key}: в чекпоинте={ckpt_val}, в config.py={cfg_val}")
+                print("   Либо верни эти значения в config.py как в чекпоинте (чтобы продолжить обучение),")
+                print("   либо начни обучение с нуля с новой архитектурой (переименуй/очисти ./checkpoints).")
+                sys.exit(1)
+
         encoder.load_state_dict(ckpt['context_encoder_state'])
         predictor.load_state_dict(ckpt['predictor_state'])
         target_encoder.load_state_dict(ckpt['target_encoder_state'])
@@ -395,7 +420,14 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
         
         global_step = ckpt.get('global_step', 0)
         start_file_idx = ckpt.get('shard_idx', 0) + 1
-        
+
+        # Восстанавливаем ИЗНАЧАЛЬНЫЙ total_steps, чтобы кривая LR (cosine)
+        # не "сжималась/растягивалась" при resume с другим --steps-per-shard
+        if 'total_steps' in ckpt:
+            config.total_steps = ckpt['total_steps']
+            print(f"   ⚙️  total_steps восстановлен из чекпоинта: {config.total_steps} "
+                  f"(LR-расписание не будет искажено сменой --steps-per-shard)")
+
         print(f"   Продолжаем с шарда {start_file_idx}, шаг {global_step}")
     else:
         print("\n🆕 Обучение с нуля")
@@ -447,7 +479,11 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
         )
         
         # Сохранение чекпоинта
+        # Пишем во временный файл и переименовываем атомарно: если запись
+        # оборвётся (например, кончилось место на диске), на месте ckpt_path
+        # останется предыдущий валидный чекпоинт, а не битый недописанный файл.
         ckpt_path = os.path.join(CHECKPOINTS_DIR, f"jepa_shard_{file_idx:03d}.pt")
+        tmp_ckpt_path = ckpt_path + ".tmp"
         torch.save({
             'context_encoder_state': encoder.state_dict(),
             'predictor_state': predictor.state_dict(),
@@ -457,8 +493,30 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
             'mask_token': mask_token.data,
             'global_step': global_step,
             'shard_idx': file_idx,
-        }, ckpt_path)
+            'total_steps': config.total_steps,
+            'arch_config': {
+                'input_dim': config.input_dim,
+                'hidden_dim': config.hidden_dim,
+                'embed_dim': config.embed_dim,
+                'num_layers': config.num_layers,
+                'nhead': config.nhead,
+                'max_seq_len': config.max_seq_len,
+            },
+        }, tmp_ckpt_path)
+        os.replace(tmp_ckpt_path, ckpt_path)
         print(f"\n💾 [ЧЕКПОИНТ] Шард {file_idx} → {ckpt_path}")
+
+        # Ротация чекпоинтов: храним только последние KEEP_LAST_CHECKPOINTS,
+        # иначе на длинных прогонах (50+ файлов) диск гарантированно забьётся —
+        # каждый чекпоинт включает состояние Adam (~2x размера модели).
+        KEEP_LAST_CHECKPOINTS = 3
+        old_ckpts = sorted(Path(CHECKPOINTS_DIR).glob("jepa_shard_*.pt"))
+        for old_ckpt in old_ckpts[:-KEEP_LAST_CHECKPOINTS]:
+            try:
+                old_ckpt.unlink()
+                print(f"   🗑  Старый чекпоинт удалён: {old_ckpt.name}")
+            except Exception:
+                pass
         
         # Очистка временных файлов
         try:
@@ -521,4 +579,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
