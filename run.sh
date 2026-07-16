@@ -5,8 +5,11 @@ echo "============================================================"
 echo "🚀 Text-JEPA (gpu_jepa): Автоматическая настройка окружения"
 echo "============================================================"
 
-REPO_URL="https://github.com/vasil646srb/gpu_jepa.git"
-REPO_DIR="gpu_jepa"
+# run.sh лежит внутри самого репозитория — просто переходим в его
+# директорию, никуда клонироваться не нужно.
+cd "$(dirname "$(readlink -f "$0")")"
+
+MODEL_PATH="./bge-large-en-v1.5-onnx"
 
 # ==========================================
 # Определение GPU
@@ -30,14 +33,6 @@ fi
 
 $SUDO apt-get update -qq
 $SUDO apt-get install -y -qq git python3-pip python3-venv build-essential screen nvtop 2>/dev/null || true
-
-# ==========================================
-# Клонирование ПРАВИЛЬНОГО репозитория
-# ==========================================
-if [ ! -d "$REPO_DIR" ]; then
-    git clone "$REPO_URL" "$REPO_DIR"
-fi
-cd "$REPO_DIR"
 
 # ==========================================
 # Venv
@@ -83,11 +78,32 @@ else
 fi
 
 # ==========================================
-# Базовая модель BGE-large скачивается автоматически
-# самим train_streaming.py / test_jepa.py при первом запуске
-# (ensure_base_model_available), в правильный путь
-# ./bge-large-en-v1.5-onnx — отдельно скачивать в run.sh не нужно.
+# Базовая модель BGE-large (ONNX)
+# Та же логика, что и в ensure_base_model_available() из train_streaming.py:
+# качаем, только если model.onnx ещё не лежит в MODEL_PATH.
 # ==========================================
+if [ -d "$MODEL_PATH" ] && ls "$MODEL_PATH"/*.onnx >/dev/null 2>&1; then
+    echo "✅ Базовая модель уже есть: $MODEL_PATH"
+else
+    echo "📥 Базовая модель не найдена, скачиваю Xenova/bge-large-en-v1.5..."
+    python3 - "$MODEL_PATH" <<'PYEOF'
+import sys, shutil
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+model_path = sys.argv[1]
+snapshot_download(repo_id="Xenova/bge-large-en-v1.5", local_dir=model_path)
+
+# ONNX-веса у Xenova лежат в подпапке onnx/ — переносим model.onnx в корень,
+# т.к. AutoTokenizer/ort.InferenceSession в проекте ждут его именно там.
+onnx_subdir = Path(model_path) / "onnx" / "model.onnx"
+target = Path(model_path) / "model.onnx"
+if onnx_subdir.exists() and not target.exists():
+    shutil.move(str(onnx_subdir), str(target))
+
+print(f"✅ Модель скачана в {model_path}")
+PYEOF
+fi
 
 mkdir -p checkpoints shards
 
@@ -99,7 +115,7 @@ echo ""
 echo "Запуск обучения (в отдельной screen-сессии, чтобы пережить обрыв связи):"
 echo "   screen -S jepa"
 echo "   source .venv/bin/activate"
-echo "   python train_streaming.py --num-files 50 --examples-per-file 10000 --steps-per-shard 1000"
+echo "   python train_streaming.py --num-files 50 --examples-per-file 10000 --steps-per-shard 500"
 echo ""
 echo "Отсоединиться от screen: Ctrl+A, затем D"
 echo "Вернуться обратно:       screen -r jepa"
