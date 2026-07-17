@@ -42,13 +42,13 @@ else:
 # ==========================================
 class ModelConfig:
     """Архитектурные параметры JEPA."""
-    input_dim = 1024          # BGE-Small embedding dim (или автоопределение)
-    hidden_dim = 512          # Внутренняя размерность
-    embed_dim = 512           # Выходная размерность JEPA
-    num_layers = 8            # Слои Transformer Encoder
-    nhead = 8                 # Количество голов внимания
-    max_seq_len = 128          # Максимальная длина последовательности
-    dropout = 0.1             # Dropout для регуляризации
+    input_dim = 1024
+    hidden_dim = 512
+    embed_dim = 512
+    num_layers = 8
+    nhead = 8
+    max_seq_len = 128
+    dropout = 0.1
 
 
 # ==========================================
@@ -64,17 +64,23 @@ class TrainConfig:
     max_grad_norm = 1.0
 
     # Шарды и потоковая загрузка
-    steps_per_shard = 1000      # Шагов обучения на одном шарде
-    parquet_batch_size = 2000   # Размер батча для чтения parquet
-    shard_size = 10000          # Размер шарда в примерах
-    num_files_to_process = 10   # Количество файлов для обработки
-    examples_per_file = 10000 # Примеров из одного parquet-файла (0 = все)
-    delete_parquet_after = True # Удалять parquet после обработки
-
-    # Режим обработки файла:
-    # "fixed" - брать только examples_per_file примеров с начала файла
-    # "full"  - обработать ВЕСЬ файл, создавая multiple shards
+    steps_per_shard = 1000
+    parquet_batch_size = 2000
+    shard_size = 10000
+    num_files_to_process = 10
+    examples_per_file = 10000
+    delete_parquet_after = True
     file_process_mode = "fixed"  # "fixed" или "full"
+
+    # DataLoader
+    num_workers = 0
+    pin_memory = True
+    drop_last = True
+
+    # Embedding engine
+    embedding_backend = "auto"
+    embedding_max_length = 256
+    embedding_encode_batch = 64
 
     # Пути
     checkpoint_dir = "./checkpoints"
@@ -220,7 +226,6 @@ class Config:
 
 
 def get_amp_dtype():
-    """Возвращает torch dtype для AMP."""
     if Config.amp_dtype == "bfloat16":
         return torch.bfloat16
     elif Config.amp_dtype == "float16":
@@ -229,12 +234,10 @@ def get_amp_dtype():
 
 
 def get_parquet_filenames(num_files):
-    """Генерирует список parquet-файлов."""
     return [Config.parquet_files_pattern.format(i=i) for i in range(num_files)]
 
 
 def print_config():
-    """Красивый вывод конфигурации."""
     print("\n" + "=" * 60)
     print("📋 КОНФИГУРАЦИЯ TEXT-JEPA")
     print("=" * 60)
