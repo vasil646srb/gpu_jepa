@@ -8,14 +8,13 @@ import sys
 import torch
 import torch.nn.functional as F
 import numpy as np
-from transformers import AutoTokenizer
-import onnxruntime as ort
+from sentence_transformers import SentenceTransformer
 from pathlib import Path
 from itertools import permutations
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from models import TextJEPAEncoder
-from config import Config, DEVICE, NUM_CORES, get_onnx_graph_opt_level, get_onnx_execution_mode
+from config import Config, DEVICE, NUM_CORES
 
 # ==========================================
 # НАСТРОЙКИ
@@ -24,46 +23,15 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 # ==========================================
-# АВТОЗАГРУЗКА И ПОИСК ФАЙЛОВ
+# АВТОЗАГРУЗКА И ПОИСК ЧЕКПОИНТОВ
 # ==========================================
-def ensure_base_model():
-    """Скачивает базовую модель BGE, если она отсутствует."""
-    model_path = Config.onnx_model_path
-    if Path(model_path).exists() and list(Path(model_path).glob("*.onnx")):
-        return
-    print(f"📥 Базовая модель не найдена. Скачиваю с HF Hub...")
-    from huggingface_hub import snapshot_download
-    try:
-        snapshot_download(repo_id=Config.onnx_repo_id, local_dir="./", allow_patterns=[f"{model_path}/*"])
-        onnx_sub = Path(model_path) / "onnx" / "model.onnx"
-        if onnx_sub.exists():
-            import shutil
-            shutil.move(str(onnx_sub), str(Path(model_path) / "model.onnx"))
-    except Exception:
-        snapshot_download(repo_id=Config.onnx_fallback_repo, local_dir=model_path)
-        onnx_sub = Path(model_path) / "onnx" / "model.onnx"
-        if onnx_sub.exists():
-            import shutil
-            shutil.move(str(onnx_sub), str(Path(model_path) / "model.onnx"))
-
-
 def find_latest_checkpoint():
-    """Находит последний чекпоинт или скачивает с HF Hub."""
-    ckpt_dir = Path(Config.test_checkpoint_dir)
+    """Находит последний чекпоинт."""
+    ckpt_dir = Path(Config.checkpoint_dir)
     if ckpt_dir.exists():
-        checkpoints = sorted(ckpt_dir.glob(Config.test_checkpoint_pattern))
+        checkpoints = sorted(ckpt_dir.glob("jepa_shard_*.pt"))
         if checkpoints:
             return str(checkpoints[-1])
-
-    print(f"📥 Локальные чекпоинты не найдены. Скачиваю с HF Hub...")
-    from huggingface_hub import snapshot_download
-    try:
-        snapshot_download(repo_id=Config.onnx_repo_id, local_dir="./", allow_patterns=[f"{Config.test_checkpoint_dir}/*.pt"])
-        checkpoints = sorted(Path(Config.test_checkpoint_dir).glob(Config.test_checkpoint_pattern))
-        if checkpoints:
-            return str(checkpoints[-1])
-    except Exception as e:
-        print(f"❌ Не удалось скачать чекпоинты: {e}")
     return None
 
 
@@ -72,32 +40,13 @@ def find_latest_checkpoint():
 # ==========================================
 def load_models():
     print("🔄 Загрузка моделей...")
-    ensure_base_model()
 
-    tokenizer = AutoTokenizer.from_pretrained(Config.onnx_model_path)
-    onnx_files = sorted([f for f in os.listdir(Config.onnx_model_path) if f.endswith('.onnx')])
-
-    sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = get_onnx_graph_opt_level()
-
-    # Автоопределение провайдеров ONNX (GPU или CPU)
-    available_providers = ort.get_available_providers()
-    if DEVICE.type == "cuda" and "CUDAExecutionProvider" in available_providers:
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        sess_options.intra_op_num_threads = Config.onnx_cuda_threads
-        print(f"🎮 ONNX Runtime: CUDAExecutionProvider (GPU)")
-    else:
-        providers = ['CPUExecutionProvider']
-        sess_options.intra_op_num_threads = Config.onnx_cpu_threads
-        sess_options.execution_mode = get_onnx_execution_mode()
-        print(f"💻 ONNX Runtime: CPUExecutionProvider ({Config.onnx_cpu_threads} потоков)")
-
-    ort_session = ort.InferenceSession(
-        os.path.join(Config.onnx_model_path, onnx_files[0]),
-        sess_options=sess_options,
-        providers=providers
-    )
-    expected_inputs = [inp.name for inp in ort_session.get_inputs()]
+    # Загрузка базовой embedding модели (SentenceTransformers, как в обучении)
+    print(f"📦 Загрузка embedding модели: {Config.model_path}")
+    st_model = SentenceTransformer(Config.model_path, device=DEVICE.type, trust_remote_code=True)
+    tokenizer = st_model.tokenizer
+    transformer = st_model[0].auto_model
+    max_len = getattr(st_model, 'max_seq_length', Config.max_seq_len)
 
     config = Config()
     encoder = TextJEPAEncoder(
@@ -108,7 +57,7 @@ def load_models():
 
     checkpoint_path = find_latest_checkpoint()
     if not checkpoint_path:
-        print("❌ ОШИБКА: Чекпоинты не найдены ни локально, ни на HF Hub!")
+        print("❌ ОШИБКА: Чекпоинты не найдены!")
         print("   Сначала запустите обучение: python train_streaming.py ...")
         sys.exit(1)
 
@@ -117,48 +66,39 @@ def load_models():
     encoder.eval()
 
     step_info = ckpt.get('global_step', ckpt.get('step', 'N/A'))
-    print(f"✅ ONNX модель: {onnx_files[0]}")
+    print(f"✅ Embedding модель: {Config.model_path}")
     print(f"✅ JEPA чекпоинт: {Path(checkpoint_path).name} (шаг {step_info})")
     print(f"📐 Размерность эмбеддингов: {config.embed_dim}")
     print(f"💻 Устройство: {DEVICE}\n")
 
-    return tokenizer, ort_session, expected_inputs, encoder, config
+    return tokenizer, transformer, max_len, encoder, config
 
 
-def get_bge_embeddings(texts, tokenizer, ort_session, expected_inputs):
+def get_embeddings(texts, tokenizer, transformer, max_len, encoder, config):
+    """Получает JEPA-эмбеддинги для списка текстов."""
+    # Токенизируем
     inputs = tokenizer(
         texts,
-        padding=Config.tokenizer_padding,
-        truncation=Config.tokenizer_truncation,
-        max_length=Config.tokenizer_max_length,
-        return_tensors="np"
+        padding='max_length',
+        truncation=True,
+        max_length=max_len,
+        return_tensors="pt"
     )
-    ort_inputs = {
-        "input_ids": inputs["input_ids"].astype(np.int64),
-        "attention_mask": inputs["attention_mask"].astype(np.int64)
-    }
+    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
 
-    if "token_type_ids" in expected_inputs:
-        if "token_type_ids" in inputs:
-            ort_inputs["token_type_ids"] = inputs["token_type_ids"].astype(np.int64)
-        else:
-            ort_inputs["token_type_ids"] = np.zeros_like(inputs["input_ids"], dtype=np.int64)
-
-    outputs = ort_session.run(None, ort_inputs)
-    embeddings = torch.tensor(outputs[0], dtype=torch.float32)
-    embeddings = F.normalize(embeddings, p=2, dim=-1, eps=1e-9)
-    key_padding_mask = torch.tensor(inputs["attention_mask"] == 0, dtype=torch.bool)
-
-    return embeddings, key_padding_mask
-
-
-def get_jepa_embeddings(texts, tokenizer, ort_session, expected_inputs, encoder, config):
+    # Получаем эмбеддинги токенов
     with torch.no_grad():
-        x, key_padding_mask = get_bge_embeddings(texts, tokenizer, ort_session, expected_inputs)
-        x = x.to(DEVICE, non_blocking=True)
-        key_padding_mask = key_padding_mask.to(DEVICE, non_blocking=True)
+        outputs = transformer(**inputs)
+        x = outputs.last_hidden_state.float()
+
+    # Маска паддинга
+    key_padding_mask = (inputs["attention_mask"] == 0)
+
+    # JEPA encoder
+    with torch.no_grad():
         _, pooled_repr = encoder(x, key_padding_mask)
         pooled_repr = F.normalize(pooled_repr, p=2, dim=-1)
+
     return pooled_repr.cpu().numpy()
 
 
@@ -177,7 +117,7 @@ def print_result(task_name, passed, total, details=""):
 # ==========================================
 # ТЕСТЫ
 # ==========================================
-def test_paraphrases(encoder, tokenizer, ort_session, expected_inputs, config):
+def test_paraphrases(encoder, tokenizer, transformer, max_len, config):
     print("=" * 70)
     print("🧪 ТЕСТ 1: ПАРАФРАЗЫ (Paraphrase Detection)")
     print("=" * 70)
@@ -194,7 +134,7 @@ def test_paraphrases(encoder, tokenizer, ort_session, expected_inputs, config):
     passed = 0
     threshold = Config.paraphrase_threshold
     for sent_a, sent_b in paraphrase_pairs:
-        embs = get_jepa_embeddings([sent_a, sent_b], tokenizer, ort_session, expected_inputs, encoder, config)
+        embs = get_embeddings([sent_a, sent_b], tokenizer, transformer, max_len, encoder, config)
         sim = cosine_sim(embs[0], embs[1])
         status = "✓" if sim >= threshold else "✗"
         if sim >= threshold: passed += 1
@@ -203,7 +143,7 @@ def test_paraphrases(encoder, tokenizer, ort_session, expected_inputs, config):
     return passed, len(paraphrase_pairs)
 
 
-def test_odd_one_out(encoder, tokenizer, ort_session, expected_inputs, config):
+def test_odd_one_out(encoder, tokenizer, transformer, max_len, config):
     print("\n" + "=" * 70)
     print("🧪 ТЕСТ 2: БЕЛАЯ ВОРОНА (Odd-one-out)")
     print("=" * 70)
@@ -215,7 +155,7 @@ def test_odd_one_out(encoder, tokenizer, ort_session, expected_inputs, config):
     passed = 0
     for case in test_cases:
         print(f"\n  🎯 Тема: {case['theme']}")
-        embs = get_jepa_embeddings(case["texts"], tokenizer, ort_session, expected_inputs, encoder, config)
+        embs = get_embeddings(case["texts"], tokenizer, transformer, max_len, encoder, config)
         avg_sims = []
         for i in range(len(embs)):
             other_sims = [cosine_sim(embs[i], embs[j]) for j in range(len(embs)) if i != j]
@@ -229,7 +169,7 @@ def test_odd_one_out(encoder, tokenizer, ort_session, expected_inputs, config):
     return passed, len(test_cases)
 
 
-def test_noise_robustness(encoder, tokenizer, ort_session, expected_inputs, config):
+def test_noise_robustness(encoder, tokenizer, transformer, max_len, config):
     print("\n" + "=" * 70)
     print("🧪 ТЕСТ 3: УСТОЙЧИВОСТЬ К ШУМУ (Noise Robustness)")
     print("=" * 70)
@@ -243,7 +183,7 @@ def test_noise_robustness(encoder, tokenizer, ort_session, expected_inputs, conf
         ("Лишние слова", "Well, I think artificial intelligence will definitely transform healthcare"),
     ]
     all_texts = [original] + [v[1] for v in noisy_versions]
-    embs = get_jepa_embeddings(all_texts, tokenizer, ort_session, expected_inputs, encoder, config)
+    embs = get_embeddings(all_texts, tokenizer, transformer, max_len, encoder, config)
     passed = 0
     threshold = Config.noise_robustness_threshold
     for i, (noise_type, text) in enumerate(noisy_versions):
@@ -255,7 +195,7 @@ def test_noise_robustness(encoder, tokenizer, ort_session, expected_inputs, conf
     return passed, len(noisy_versions)
 
 
-def test_asymmetric_retrieval(encoder, tokenizer, ort_session, expected_inputs, config):
+def test_asymmetric_retrieval(encoder, tokenizer, transformer, max_len, config):
     print("\n" + "=" * 70)
     print("🧪 ТЕСТ 4: АСИММЕТРИЧНЫЙ ПОИСК (Asymmetric Retrieval)")
     print("=" * 70)
@@ -268,7 +208,7 @@ def test_asymmetric_retrieval(encoder, tokenizer, ort_session, expected_inputs, 
     for case in test_cases:
         print(f"\n  🔍 Запрос: '{case['query']}'")
         all_texts = [case["query"]] + case["documents"]
-        embs = get_jepa_embeddings(all_texts, tokenizer, ort_session, expected_inputs, encoder, config)
+        embs = get_embeddings(all_texts, tokenizer, transformer, max_len, encoder, config)
         query_emb = embs[0]
         doc_embs = embs[1:]
         sims = [cosine_sim(query_emb, doc) for doc in doc_embs]
@@ -281,7 +221,7 @@ def test_asymmetric_retrieval(encoder, tokenizer, ort_session, expected_inputs, 
     return passed, len(test_cases)
 
 
-def test_fine_grained_senses(encoder, tokenizer, ort_session, expected_inputs, config):
+def test_fine_grained_senses(encoder, tokenizer, transformer, max_len, config):
     print("\n" + "=" * 70)
     print("🧪 ТЕСТ 5: ТОНКИЕ СМЫСЛЫ (Word Sense Disambiguation)")
     print("=" * 70)
@@ -299,7 +239,7 @@ def test_fine_grained_senses(encoder, tokenizer, ort_session, expected_inputs, c
     close_thr = Config.fine_grained_close_threshold
     far_thr = Config.fine_grained_far_threshold
     for sent_a, sent_b, should_be_close in test_pairs:
-        embs = get_jepa_embeddings([sent_a, sent_b], tokenizer, ort_session, expected_inputs, encoder, config)
+        embs = get_embeddings([sent_a, sent_b], tokenizer, transformer, max_len, encoder, config)
         sim = cosine_sim(embs[0], embs[1])
         is_correct = (sim > close_thr) if should_be_close else (sim < far_thr)
         if is_correct: passed += 1
@@ -310,7 +250,7 @@ def test_fine_grained_senses(encoder, tokenizer, ort_session, expected_inputs, c
     return passed, len(test_pairs)
 
 
-def test_unsupervised_clustering(encoder, tokenizer, ort_session, expected_inputs, config):
+def test_unsupervised_clustering(encoder, tokenizer, transformer, max_len, config):
     print("\n" + "=" * 70)
     print("🧪 ТЕСТ 6: КЛАСТЕРИЗАЦИЯ БЕЗ УЧИТЕЛЯ (Unsupervised Clustering)")
     print("=" * 70)
@@ -320,7 +260,7 @@ def test_unsupervised_clustering(encoder, tokenizer, ort_session, expected_input
         "The soccer team won the championship", "Tennis requires quick reflexes and agility", "Marathon runners train for months", "The basketball game went into overtime", "Swimming is excellent cardiovascular exercise", "The Olympic Games bring nations together",
     ]
     true_labels = ([0] * 6) + ([1] * 6) + ([2] * 6)
-    embs = get_jepa_embeddings(texts, tokenizer, ort_session, expected_inputs, encoder, config)
+    embs = get_embeddings(texts, tokenizer, transformer, max_len, encoder, config)
 
     def simple_kmeans(X, k=3, max_iter=50):
         n = X.shape[0]
@@ -362,7 +302,7 @@ def test_unsupervised_clustering(encoder, tokenizer, ort_session, expected_input
     return passed, 1
 
 
-def test_hierarchical_similarity(encoder, tokenizer, ort_session, expected_inputs, config):
+def test_hierarchical_similarity(encoder, tokenizer, transformer, max_len, config):
     print("\n" + "=" * 70)
     print("🧪 ТЕСТ 7: ИЕРАРХИЯ ПОНЯТИЙ (Hierarchical Similarity)")
     print("=" * 70)
@@ -374,7 +314,7 @@ def test_hierarchical_similarity(encoder, tokenizer, ort_session, expected_input
     passed = 0
     for h in hierarchies:
         texts = [h["abstract"], h["middle"], h["specific"]]
-        embs = get_jepa_embeddings(texts, tokenizer, ort_session, expected_inputs, encoder, config)
+        embs = get_embeddings(texts, tokenizer, transformer, max_len, encoder, config)
         sim_am = cosine_sim(embs[0], embs[1])
         sim_ms = cosine_sim(embs[1], embs[2])
         sim_as = cosine_sim(embs[0], embs[2])
@@ -394,16 +334,16 @@ def test_hierarchical_similarity(encoder, tokenizer, ort_session, expected_input
 def main():
     print("🚀 ТЕСТИРОВАНИЕ ОБУЧЕННОЙ TEXT-JEPA МОДЕЛИ")
     print("=" * 70)
-    tokenizer, ort_session, expected_inputs, encoder, config = load_models()
+    tokenizer, transformer, max_len, encoder, config = load_models()
 
     results = []
-    results.append(("1. Парафразы", test_paraphrases(encoder, tokenizer, ort_session, expected_inputs, config)))
-    results.append(("2. Белая ворона", test_odd_one_out(encoder, tokenizer, ort_session, expected_inputs, config)))
-    results.append(("3. Устойчивость к шуму", test_noise_robustness(encoder, tokenizer, ort_session, expected_inputs, config)))
-    results.append(("4. Асимметричный поиск", test_asymmetric_retrieval(encoder, tokenizer, ort_session, expected_inputs, config)))
-    results.append(("5. Тонкие смыслы", test_fine_grained_senses(encoder, tokenizer, ort_session, expected_inputs, config)))
-    results.append(("6. Кластеризация", test_unsupervised_clustering(encoder, tokenizer, ort_session, expected_inputs, config)))
-    results.append(("7. Иерархия понятий", test_hierarchical_similarity(encoder, tokenizer, ort_session, expected_inputs, config)))
+    results.append(("1. Парафразы", test_paraphrases(encoder, tokenizer, transformer, max_len, config)))
+    results.append(("2. Белая ворона", test_odd_one_out(encoder, tokenizer, transformer, max_len, config)))
+    results.append(("3. Устойчивость к шуму", test_noise_robustness(encoder, tokenizer, transformer, max_len, config)))
+    results.append(("4. Асимметричный поиск", test_asymmetric_retrieval(encoder, tokenizer, transformer, max_len, config)))
+    results.append(("5. Тонкие смыслы", test_fine_grained_senses(encoder, tokenizer, transformer, max_len, config)))
+    results.append(("6. Кластеризация", test_unsupervised_clustering(encoder, tokenizer, transformer, max_len, config)))
+    results.append(("7. Иерархия понятий", test_hierarchical_similarity(encoder, tokenizer, transformer, max_len, config)))
 
     print("\n\n" + "=" * 70)
     print("📊 ИТОГОВЫЙ ОТЧЁТ")
