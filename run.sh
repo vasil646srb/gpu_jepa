@@ -1,125 +1,209 @@
 #!/bin/bash
 set -e
 
-echo "============================================================"
-echo "🚀 Text-JEPA (gpu_jepa): Автоматическая настройка окружения"
-echo "============================================================"
-
-# run.sh лежит внутри самого репозитория — просто переходим в его
-# директорию, никуда клонироваться не нужно.
-cd "$(dirname "$(readlink -f "$0")")"
-
-MODEL_PATH="./bge-large-en-v1.5-onnx"
+echo "=========================================="
+echo "🚀 GPU-JEPA Deployment Script"
+echo "Container: nvcr.io/nvidia/pytorch:24.08-py3"
+echo "=========================================="
 
 # ==========================================
-# Определение GPU
+# 0. ПРОВЕРКА ОКРУЖЕНИЯ
 # ==========================================
-GPU_AVAILABLE=false
-if command -v nvidia-smi &> /dev/null; then
-    GPU_INFO=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true)
-    if [ -n "$GPU_INFO" ]; then
-        GPU_AVAILABLE=true
-        echo "🎮 GPU: $GPU_INFO"
-    fi
+echo ""
+echo "🔍 Проверка окружения..."
+
+python --version
+python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}')"
+
+# ==========================================
+# 1. ОБНОВЛЕНИЕ PIP И БАЗОВЫЕ ЗАВИСИМОСТИ
+# ==========================================
+echo ""
+echo "📦 Обновление pip..."
+pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# ==========================================
+# 2. УСТАНОВКА ЗАВИСИМОСТЕЙ
+# ==========================================
+echo ""
+echo "📦 Установка зависимостей..."
+
+# Проверяем наличие constraint файла (может быть в более новых контейнерах)
+if [ -f "/etc/pip/constraint.txt" ]; then
+    echo "⚠️  Обнаружен pip constraint файл. Удаляем ограничения для наших пакетов..."
+    # Сохраняем оригинал
+    cp /etc/pip/constraint.txt /etc/pip/constraint.txt.bak
+    # Удаляем ограничения для пакетов, которые мы хотим обновить
+    sed -i '/sentence-transformers/d' /etc/pip/constraint.txt || true
+    sed -i '/transformers/d' /etc/pip/constraint.txt || true
+    sed -i '/onnxruntime/d' /etc/pip/constraint.txt || true
+    sed -i '/huggingface-hub/d' /etc/pip/constraint.txt || true
+    sed -i '/numpy/d' /etc/pip/constraint.txt || true
+    sed -i '/pyarrow/d' /etc/pip/constraint.txt || true
 fi
 
-# ==========================================
-# Системные пакеты (sudo, только если не root)
-# ==========================================
-SUDO=""
-if [ "$(id -u)" -ne 0 ]; then
-    SUDO="sudo"
-fi
+# Основные пакеты (PyTorch уже в контейнере)
+pip install --no-cache-dir \
+    sentence-transformers \
+    transformers \
+    accelerate \
+    huggingface-hub \
+    pyarrow \
+    numpy \
+    scipy
 
-$SUDO apt-get update -qq
-$SUDO apt-get install -y git python3-pip python3-venv build-essential screen nvtop 2>/dev/null || true
+# ONNX Runtime с GPU поддержкой (CUDA 12.x)
+pip install --no-cache-dir onnxruntime-gpu
 
-# ==========================================
-# Venv
-# ==========================================
-[ ! -d ".venv" ] && python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
+# FlagEmbedding (опционально, для BGE-M3)
+pip install --no-cache-dir FlagEmbedding || echo "⚠️ FlagEmbedding не удалось установить, будет fallback на sentence-transformers"
 
 # ==========================================
-# PyTorch
-# RTX 50xx (Blackwell, sm_120) требует CUDA 12.8+.
-# cu121/cu124 колёса не содержат нужных kernel'ов для этой архитектуры.
+# 3. ПРОВЕРКА УСТАНОВКИ
 # ==========================================
-if [ "$GPU_AVAILABLE" = true ]; then
-    echo "📦 Установка PyTorch (CUDA 12.8, для Blackwell/RTX 50xx)..."
-    pip install torch
-else
-    echo "📦 Установка PyTorch (CPU)..."
-    pip install torch --index-url https://download.pytorch.org/whl/cpu -q
-fi
+echo ""
+echo "✅ Проверка установленных пакетов..."
 
-# Проверка, что CUDA реально видна PyTorch
-python3 - <<'PYEOF'
+python -c "
 import torch
-print(f"   PyTorch: {torch.__version__}")
-print(f"   CUDA доступна: {torch.cuda.is_available()}")
+import transformers
+import sentence_transformers
+import onnxruntime
+import pyarrow
+import numpy
+
+print(f'✅ torch: {torch.__version__}')
+print(f'✅ transformers: {transformers.__version__}')
+print(f'✅ sentence-transformers: {sentence_transformers.__version__}')
+print(f'✅ onnxruntime: {onnxruntime.__version__}')
+print(f'✅ pyarrow: {pyarrow.__version__}')
+print(f'✅ numpy: {numpy.__version__}')
+
+# Проверка CUDA для ONNX
+providers = onnxruntime.get_available_providers()
+print(f'✅ ONNX providers: {providers}')
+
+# Проверка GPU
 if torch.cuda.is_available():
-    print(f"   GPU: {torch.cuda.get_device_name(0)}")
-    print(f"   Compute capability: {torch.cuda.get_device_capability(0)}")
-PYEOF
+    print(f'✅ GPU: {torch.cuda.get_device_name(0)}')
+    print(f'✅ VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
+else:
+    print('⚠️ GPU не доступна, будет использоваться CPU')
+"
 
 # ==========================================
-# ML-библиотеки (только реально используемые в коде)
+# 4. СОЗДАНИЕ СТРУКТУРЫ ПРОЕКТА
 # ==========================================
-echo "📦 Установка ML-библиотек..."
-pip install numpy transformers huggingface_hub pyarrow
+echo ""
+echo "📁 Создание структуры проекта..."
 
-if [ "$GPU_AVAILABLE" = true ]; then
-    pip uninstall -y onnxruntime onnxruntime-gpu 2>/dev/null || true
-    pip install -q onnxruntime-gpu
+mkdir -p /workspace/gpu_jepa
+mkdir -p /workspace/gpu_jepa/checkpoints
+mkdir -p /workspace/gpu_jepa/shards
+mkdir -p /workspace/gpu_jepa/test_results
+
+cd /workspace/gpu_jepa
+
+# ==========================================
+# 5. КОПИРОВАНИЕ ИСХОДНИКОВ (если есть рядом)
+# ==========================================
+echo ""
+echo "📂 Копирование исходников..."
+
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+
+if [ -d "$SCRIPT_DIR/src" ]; then
+    cp -r "$SCRIPT_DIR/src"/* /workspace/gpu_jepa/
+    echo "✅ Исходники скопированы из $SCRIPT_DIR/src/"
+elif [ -f "$SCRIPT_DIR/config.py" ]; then
+    cp "$SCRIPT_DIR"/*.py /workspace/gpu_jepa/
+    echo "✅ Исходники скопированы из $SCRIPT_DIR/"
 else
-    pip install -q onnxruntime
+    echo "⚠️  Исходники не найдены рядом со скриптом."
+    echo "   Ожидается структура:"
+    echo "   run.sh"
+    echo "   config.py"
+    echo "   train_streaming.py"
+    echo "   test_jepa.py"
+    echo "   boss_fight.py"
+    echo "   models.py"
+    echo "   dataset.py"
+    echo "   losses.py"
 fi
 
 # ==========================================
-# Базовая модель BGE-large (ONNX)
-# Та же логика, что и в ensure_base_model_available() из train_streaming.py:
-# качаем, только если model.onnx ещё не лежит в MODEL_PATH.
+# 6. ПРОВЕРКА ИСХОДНИКОВ
 # ==========================================
-if [ -d "$MODEL_PATH" ] && ls "$MODEL_PATH"/*.onnx >/dev/null 2>&1; then
-    echo "✅ Базовая модель уже есть: $MODEL_PATH"
-else
-    echo "📥 Базовая модель не найдена, скачиваю Xenova/bge-large-en-v1.5..."
-    python3 - "$MODEL_PATH" <<'PYEOF'
-import sys, shutil
-from pathlib import Path
-from huggingface_hub import snapshot_download
-
-model_path = sys.argv[1]
-snapshot_download(repo_id="Xenova/bge-large-en-v1.5", local_dir=model_path)
-
-# ONNX-веса у Xenova лежат в подпапке onnx/ — переносим model.onnx в корень,
-# т.к. AutoTokenizer/ort.InferenceSession в проекте ждут его именно там.
-onnx_subdir = Path(model_path) / "onnx" / "model.onnx"
-target = Path(model_path) / "model.onnx"
-if onnx_subdir.exists() and not target.exists():
-    shutil.move(str(onnx_subdir), str(target))
-
-print(f"✅ Модель скачана в {model_path}")
-PYEOF
-fi
-
-mkdir -p checkpoints shards
-
 echo ""
-echo "============================================================"
-echo "✅ ГОТОВО! Окружение настроено в $(pwd)"
-echo "============================================================"
+echo "🔍 Проверка исходников..."
+
+for file in config.py models.py dataset.py losses.py train_streaming.py test_jepa.py boss_fight.py; do
+    if [ -f "/workspace/gpu_jepa/$file" ]; then
+        echo "  ✅ $file"
+    else
+        echo "  ❌ $file — отсутствует!"
+    fi
+done
+
+# ==========================================
+# 7. ПРОВЕРКА СИНТАКСИСА
+# ==========================================
 echo ""
-echo "Запуск обучения (в отдельной screen-сессии, чтобы пережить обрыв связи):"
-echo "   screen -S jepa"
-echo "   source .venv/bin/activate"
-echo "   python train_streaming.py --num-files 50 --examples-per-file 10000 --steps-per-shard 500"
+echo "🔍 Проверка синтаксиса Python..."
+
+python -m py_compile /workspace/gpu_jepa/config.py
+python -m py_compile /workspace/gpu_jepa/models.py
+python -m py_compile /workspace/gpu_jepa/dataset.py
+python -m py_compile /workspace/gpu_jepa/losses.py
+python -m py_compile /workspace/gpu_jepa/train_streaming.py
+python -m py_compile /workspace/gpu_jepa/test_jepa.py
+python -m py_compile /workspace/gpu_jepa/boss_fight.py
+
+echo "✅ Синтаксис OK"
+
+# ==========================================
+# 8. ТЕСТОВЫЙ ЗАПУСК КОНФИГА
+# ==========================================
 echo ""
-echo "Отсоединиться от screen: Ctrl+A, затем D"
-echo "Вернуться обратно:       screen -r jepa"
+echo "🧪 Тестовый запуск config.py..."
+
+cd /workspace/gpu_jepa
+python config.py
+
+# ==========================================
+# 9. ИНФОРМАЦИЯ О ЗАПУСКЕ
+# ==========================================
 echo ""
-echo "Проверка качества модели после обучения:"
-echo "   python test_jepa.py"
-echo "   python boss_fight.py"
+echo "=========================================="
+echo "🎉 Развёртывание завершено!"
+echo "=========================================="
+echo ""
+echo "📂 Рабочая директория: /workspace/gpu_jepa"
+echo ""
+echo "🚀 Команды для запуска:"
+echo ""
+echo "  # Обучение (по умолчанию: 10 файлов, 5000 примеров, 500 шагов/шард)"
+echo "  cd /workspace/gpu_jepa"
+echo "  python train_streaming.py"
+echo ""
+echo "  # Обучение с кастомными параметрами"
+echo "  python train_streaming.py --num-files 20 --examples-per-file 10000 --steps-per-shard 1000"
+echo ""
+echo "  # Возобновление обучения"
+echo "  python train_streaming.py --resume ./checkpoints/jepa_shard_009.pt"
+echo ""
+echo "  # Тестирование"
+echo "  python test_jepa.py"
+echo ""
+echo "  # Boss Fight (глубинное тестирование)"
+echo "  python boss_fight.py"
+echo ""
+echo "📊 Мониторинг GPU:"
+echo "  watch -n 1 nvidia-smi"
+echo ""
+echo "💡 Советы:"
+echo "  - Для первого теста используйте --num-files 1 --examples-per-file 100"
+echo "  - Проверьте config.py перед запуском для настройки параметров"
+echo "  - Логи сохраняются в stdout (можно перенаправить: python train_streaming.py | tee train.log)"
+echo "=========================================="
+

@@ -10,15 +10,17 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from config import Config, DEVICE
 from models import TextJEPAEncoder
 
+
 def load_jepa():
     config = Config()
     encoder = TextJEPAEncoder(
         config.input_dim, config.hidden_dim, config.embed_dim,
-        config.num_layers, config.nhead, config.max_seq_len
+        config.num_layers, config.nhead, config.max_seq_len,
+        dropout=config.dropout
     ).to(DEVICE)
 
     # Ищем последний чекпоинт
-    ckpts = sorted(Path("./checkpoints").glob("jepa_shard_*.pt"))
+    ckpts = sorted(Path(Config.boss_checkpoint_dir).glob(Config.boss_checkpoint_pattern))
     if not ckpts:
         print("❌ Чекпоинты не найдены!"); sys.exit(1)
 
@@ -33,8 +35,9 @@ def load_jepa():
     tokenizer = st_model.tokenizer
     transformer = st_model[0].auto_model
     max_len = getattr(st_model, 'max_seq_length', config.max_seq_len)
-    
+
     return encoder, tokenizer, transformer, max_len, config
+
 
 def get_emb(texts, encoder, tokenizer, transformer, max_len, config):
     # Токенизируем (точно так же, как в train_streaming.py)
@@ -46,12 +49,12 @@ def get_emb(texts, encoder, tokenizer, transformer, max_len, config):
         return_tensors="pt"
     )
     inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-    
+
     # Получаем эмбеддинги токенов (last_hidden_state)
     with torch.no_grad():
         outputs = transformer(**inputs)
         x = outputs.last_hidden_state.float()
-        
+
     # Маска паддинга (True там, где паддинг, как требует key_padding_mask в PyTorch)
     mask = (inputs["attention_mask"] == 0)
 
@@ -62,35 +65,40 @@ def get_emb(texts, encoder, tokenizer, transformer, max_len, config):
             _, pooled = out
         else:
             pooled = out
-            
+
     return F.normalize(pooled, p=2, dim=-1).cpu().numpy()
 
-def sim(a, b): return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9)
+
+def sim(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9)
+
 
 def main():
     encoder, tokenizer, transformer, max_len, config = load_jepa()
 
-    print("="*60)
+    print("=" * 60)
     print("🥊 BOSS FIGHT: Тестирование глубинного понимания JEPA")
-    print("="*60)
+    print("=" * 60)
 
     # Тест 1
     t1a = "The company reported record profits this quarter, leading to a massive expansion of their global workforce."
     t1b = "The company reported record losses this quarter, leading to a massive reduction of their global workforce."
     e1 = get_emb([t1a, t1b], encoder, tokenizer, transformer, max_len, config)
     s1 = sim(e1[0], e1[1])
+    thr1 = Config.boss_test1_threshold
     print(f"\n🧪 Тест 1: Лексическая ловушка (Антонимы)")
-    print(f"   Схожесть: {s1:.3f} (Ожидается: < 0.60)")
-    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель видит смысл, а не слова)' if s1 < 0.60 else '❌ ПРОВАЛ (Модель ослеплена общими словами)'}")
+    print(f"   Схожесть: {s1:.3f} (Ожидается: < {thr1})")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель видит смысл, а не слова)' if s1 < thr1 else '❌ ПРОВАЛ (Модель ослеплена общими словами)'}")
 
     # Тест 2
     t2a = "A virus injects its genetic material into a host cell, hijacking the replication machinery to produce more viruses."
     t2b = "A computer worm infiltrates a network, exploiting system vulnerabilities to execute payloads and replicate across nodes."
     e2 = get_emb([t2a, t2b], encoder, tokenizer, transformer, max_len, config)
     s2 = sim(e2[0], e2[1])
+    thr2 = Config.boss_test2_threshold
     print(f"\n🧪 Тест 2: Кросс-доменная абстракция")
-    print(f"   Схожесть: {s2:.3f} (Ожидается: > 0.55)")
-    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель поняла структурную аналогию)' if s2 > 0.55 else '❌ ПРОВАЛ (Модель не видит скрытых паттернов)'}")
+    print(f"   Схожесть: {s2:.3f} (Ожидается: > {thr2})")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель поняла структурную аналогию)' if s2 > thr2 else '❌ ПРОВАЛ (Модель не видит скрытых паттернов)'}")
 
     # Тест 3
     q3 = "How to avoid flooding in an underground storage space?"
@@ -109,18 +117,20 @@ def main():
     t4b = "The new software update failed to improve the system's performance, making it highly unstable."
     e4 = get_emb([t4a, t4b], encoder, tokenizer, transformer, max_len, config)
     s4 = sim(e4[0], e4[1])
+    thr4 = Config.boss_test4_threshold
     print(f"\n🧪 Тест 4: Ловушка отрицания")
-    print(f"   Схожесть: {s4:.3f} (Ожидается: < 0.75)")
-    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель чувствует инверсию смысла)' if s4 < 0.75 else '❌ ПРОВАЛ (Отрицание проигнорировано)'}")
+    print(f"   Схожесть: {s4:.3f} (Ожидается: < {thr4})")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель чувствует инверсию смысла)' if s4 < thr4 else '❌ ПРОВАЛ (Отрицание проигнорировано)'}")
 
     # Тест 5
     t5a = "The engineer refactored the legacy codebase, removing redundant loops and fixing the race condition that caused intermittent crashes."
     t5b = "The engineer introduced a race condition into the codebase by adding redundant loops, causing the application to crash intermittently."
     e5 = get_emb([t5a, t5b], encoder, tokenizer, transformer, max_len, config)
     s5 = sim(e5[0], e5[1])
+    thr5 = Config.boss_test5_threshold
     print(f"\n🧪 Тест 5: Программирование (Исправление бага vs внесение бага)")
-    print(f"   Схожесть: {s5:.3f} (Ожидается: < 0.65)")
-    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель различает fix и bug при почти одинаковой лексике)' if s5 < 0.65 else '❌ ПРОВАЛ (Модель не различает исправление и внесение бага)'}")
+    print(f"   Схожесть: {s5:.3f} (Ожидается: < {thr5})")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель различает fix и bug при почти одинаковой лексике)' if s5 < thr5 else '❌ ПРОВАЛ (Модель не различает исправление и внесение бага)'}")
 
     # Тест 6
     q6 = "Has the project plan been successfully implemented on schedule?"
@@ -134,7 +144,9 @@ def main():
     print(f"   Запрос -> Просто описание плана: {s6_bad:.3f}")
     print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель отличает выполненный план от просто описания плана)' if s6_good > s6_bad else '❌ ПРОВАЛ (Модель не различает стадию планирования и стадию реализации)'}")
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
+
 
 if __name__ == "__main__":
     main()
+

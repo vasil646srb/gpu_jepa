@@ -18,16 +18,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from config import Config, DEVICE
+from config import Config, DEVICE, get_amp_dtype, get_parquet_filenames
 from models import TextJEPAEncoder, JEPAPredictor
 from losses import VICRegLoss, compute_mask_indices, update_ema
 from dataset import ShardedEmbeddingsDataset
-
-# ==========================================
-# КОНСТАНТЫ
-# ==========================================
-CHECKPOINTS_DIR = "./checkpoints"
-SHARDS_DIR = "./shards"
 
 
 # ==========================================
@@ -40,21 +34,21 @@ class EmbeddingEngine:
       - BGE-M3 → FlagEmbedding (самый быстрый для M3)
       - Остальные → Sentence-Transformers (универсальный)
     """
-    
+
     def __init__(self, model_name: str, device: str = "cuda"):
         self.model_name = model_name
         self.device = device
         self.type = None
         self.model = None
-        
+
         print(f"📦 Загрузка embedding модели: {model_name}")
-        
+
         # Определяем тип модели
         is_local = os.path.exists(model_name)
         name_lower = model_name.lower()
-        
+
         # BGE-M3 → используем FlagEmbedding (быстрее)
-        if "bge-m3" in name_lower:
+        if Config.embedding_backend == "flag_m3" or (Config.embedding_backend == "auto" and "bge-m3" in name_lower):
             try:
                 from FlagEmbedding import BGEM3FlagModel
                 self.model = BGEM3FlagModel(
@@ -70,12 +64,12 @@ class EmbeddingEngine:
                 self._load_sentence_transformers(model_name)
         else:
             self._load_sentence_transformers(model_name)
-        
+
         # Определяем размерность
         self.dim = self._detect_dim()
         print(f"   📐 Размерность: {self.dim}")
         print(f"   💻 Устройство: {self.device}")
-    
+
     def _load_sentence_transformers(self, model_name: str):
         """Загружает модель через sentence-transformers."""
         from sentence_transformers import SentenceTransformer
@@ -84,26 +78,26 @@ class EmbeddingEngine:
             device=self.device,
             trust_remote_code=True
         )
-        self.model.max_seq_length = 256
+        self.model.max_seq_length = Config.embedding_max_length
         self.type = "sentence"
         print(f"   🎯 Backend: Sentence-Transformers")
-    
+
     def _detect_dim(self) -> int:
         """Определяет размерность эмбеддингов."""
         test_emb = self.encode(["test sentence"], batch_size=1)
         return test_emb.shape[1]
-    
+
     def encode(self, texts, batch_size=8, max_length=None, **kwargs):
         all_embs = []
-        
+
         # Получаем доступ к токенизатору и базовой модели трансформера (без пулинг-слоя)
         tokenizer = self.model.tokenizer
-        transformer = self.model[0].auto_model # self.model[0] - это сам Transformer
+        transformer = self.model[0].auto_model  # self.model[0] - это сам Transformer
         max_len = max_length if max_length is not None else getattr(self.model, 'max_seq_length', 128)
-        
+
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i:i+batch_size]
-            
+
             # Токенизируем с паддингом до фиксированной длины max_len
             inputs = tokenizer(
                 batch_texts,
@@ -114,15 +108,15 @@ class EmbeddingEngine:
             )
             # Переносим тензоры на GPU/CPU
             inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-            
+
             with torch.no_grad():
-                # Прогоняем через трансформер. 
+                # Прогоняем через трансформер.
                 # outputs.last_hidden_state имеет форму (batch, seq_len, hidden_dim)
                 outputs = transformer(**inputs)
                 embs = outputs.last_hidden_state
-                
+
                 all_embs.append(embs.cpu())
-                
+
         # Склеиваем батчи. Итоговая форма: (num_texts, seq_len, hidden_dim)
         return torch.cat(all_embs, dim=0).float().numpy()
 
@@ -133,43 +127,43 @@ class EmbeddingEngine:
 def precompute_shard(parquet_path, config, engine, shard_idx):
     """Предвычисляет эмбеддинги из parquet и сохраняет в шард."""
     import pyarrow.parquet as pq
-    
+
     print(f"\n🔧 Предвычисление эмбеддингов ({engine.device})...")
-    table = pq.read_table(parquet_path, columns=["text"])
-    texts = table["text"].to_pylist()[:config.examples_per_file]
-    
+    table = pq.read_table(parquet_path, columns=[Config.parquet_column])
+    texts = table[Config.parquet_column].to_pylist()[:config.examples_per_file]
+
     # Фильтруем валидные тексты
-    texts = [t for t in texts if isinstance(t, str) and len(t.strip()) > 10]
-    
+    texts = [t for t in texts if isinstance(t, str) and len(t.strip()) > Config.min_text_length]
+
     if not texts:
         raise ValueError(f"Нет валидных текстов в {parquet_path}")
-    
-    os.makedirs(SHARDS_DIR, exist_ok=True)
-    shard_path = os.path.join(SHARDS_DIR, f"shard_{shard_idx:03d}.npy")
-    mask_path = os.path.join(SHARDS_DIR, f"mask_{shard_idx:03d}.npy")
-    
+
+    os.makedirs(Config.shards_dir, exist_ok=True)
+    shard_path = os.path.join(Config.shards_dir, f"shard_{shard_idx:03d}.npy")
+    mask_path = os.path.join(Config.shards_dir, f"mask_{shard_idx:03d}.npy")
+
     # Обрабатываем батчами для прогресса
     all_embeddings = []
-    batch_size = config.parquet_batch_size
-    
+    batch_size = Config.parquet_batch_size
+
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i+batch_size]
-        
+
         embeddings_np = engine.encode(
             batch_texts,
-            batch_size=min(batch_size, 64),
+            batch_size=min(batch_size, Config.embedding_encode_batch),
             max_length=config.max_seq_len
         )
         all_embeddings.append(embeddings_np)
-        
+
         if (i // batch_size) % 10 == 0:
             print(f"   📊 Обработано: {min(i+batch_size, len(texts))}/{len(texts)}")
-    
+
     embeddings = np.concatenate(all_embeddings, axis=0)
-    
+
     # Создаём маску (всё валидно, так как модель сама обрабатывает padding)
     masks = np.zeros((len(embeddings), config.max_seq_len), dtype=bool)
-    
+
     np.save(shard_path, embeddings)
     np.save(mask_path, masks)
     print(f"   💾 Шард создан: {len(embeddings)} примеров → {shard_path}")
@@ -186,44 +180,44 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
     dataset = ShardedEmbeddingsDataset(shard_path, mask_path)
     loader = DataLoader(
         dataset, batch_size=config.batch_size, shuffle=True,
-        num_workers=0, pin_memory=(DEVICE.type == "cuda"), drop_last=True
+        num_workers=Config.num_workers, pin_memory=Config.pin_memory and (DEVICE.type == "cuda"),
+        drop_last=Config.drop_last
     )
-    
+
     encoder.train()
     predictor.train()
     target_encoder.eval()
-    
+
     # === AMP (Mixed Precision) ===
-    # bfloat16 - лучший выбор для RTX 3090 + VICReg
-    use_amp = (DEVICE.type == "cuda")
-    amp_dtype = torch.bfloat16
+    use_amp = Config.use_amp and (DEVICE.type == "cuda")
+    amp_dtype = get_amp_dtype()
     autocast_ctx = torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp)
     if use_amp:
         print(f"   🔥 AMP активирован: {amp_dtype}")
-    
+
     steps_per_shard = config.steps_per_shard
     step_time_acc = 0.0
     data_time_acc = 0.0
-    
+
     print(f"\n🎯 Обучение на шарде {shard_idx}: {steps_per_shard} шагов (GPU: {DEVICE.type == 'cuda'})")
     print("-" * 60)
-    
+
     step_in_shard = 0
     loader_iter = iter(loader)
-    
+
     while step_in_shard < steps_per_shard:
         try:
             x, key_padding_mask = next(loader_iter)
         except StopIteration:
             loader_iter = iter(loader)
             x, key_padding_mask = next(loader_iter)
-        
+
         data_start = time.time()
-        
+
         # Перенос на GPU/CPU
         x = x.to(DEVICE, non_blocking=True)
         key_padding_mask = key_padding_mask.to(DEVICE, non_blocking=True)
-        
+
         # Генерация масок с ФИКСИРОВАННЫМ размером
         batch_size, seq_len, _ = x.shape
         masked_indices, mask_bool = compute_mask_indices(
@@ -232,34 +226,34 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
             config.num_mask_blocks,
             config.block_size_range
         )
-        
+
         # Замаскированный вход для context encoder
         x_masked = x.clone()
         mask_token_expanded = mask_token.expand(batch_size, seq_len, -1)
         x_masked[mask_bool] = mask_token_expanded[mask_bool]
-        
+
         step_start = time.time()
         data_time_acc += step_start - data_start
-        
+
         # Forward pass (с AMP если доступно)
         with autocast_ctx:
             with torch.no_grad():
                 target_repr, _ = target_encoder(x, key_padding_mask)
-            
+
             context_repr, _ = encoder(x_masked, key_padding_mask)
             predicted_repr = predictor(context_repr, masked_indices)
-            
+
             idx_expanded = masked_indices.unsqueeze(-1).expand(-1, -1, target_repr.size(-1))
             target_masked = target_repr.gather(1, idx_expanded)
-            
+
             target_masked = target_masked.reshape(-1, target_repr.size(-1))
             predicted_masked = predicted_repr.reshape(-1, predicted_repr.size(-1))
-            
+
             # Loss ВСЕГДА считаем в fp32 для стабильности VICReg!
             total_loss, mse_loss, var_loss, cov_loss = vicreg_loss(
                 predicted_masked.float(), target_masked.float()
             )
-        
+
         # Backward pass
         optimizer.zero_grad()
         total_loss.backward()
@@ -269,19 +263,19 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
         )
         optimizer.step()
         scheduler.step()
-        
+
         # EMA обновление target encoder
         update_ema(encoder, target_encoder, config.ema_tau)
-        
+
         step_time_acc += time.time() - step_start
         step_in_shard += 1
         global_step += 1
-        
+
         # Логирование
         if step_in_shard % config.log_interval == 0:
             mask_pct = mask_bool.float().mean().item() * 100
             lr = optimizer.param_groups[0]['lr']
-            
+
             gpu_info = ""
             if DEVICE.type == "cuda":
                 try:
@@ -291,17 +285,17 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
                     gpu_info = f" | GPU={util}% VRAM={mem_used:.1f}/{mem_total:.1f}GB"
                 except Exception:
                     pass
-            
+
             print(f"[Shard {shard_idx} | Step {global_step}] 📊 LR: {lr:.2e}")
             print(f"  ├─ 📉 Total={total_loss.item():.4f} | MSE={mse_loss.item():.4f} | "
                   f"Var={var_loss.item():.4f} | Cov={cov_loss.item():.4f}")
             print(f"  ├─ ⚙️  Grad Norm={grad_norm.item():.3f} | Масок={mask_pct:.1f}%")
             print(f"  └─ ⏱  Шаг={step_time_acc/config.log_interval:.3f}s "
                   f"(Data={data_time_acc/config.log_interval:.3f}s){gpu_info}")
-            
+
             step_time_acc = 0.0
             data_time_acc = 0.0
-    
+
     return global_step
 
 
@@ -314,7 +308,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
     config.steps_per_shard = steps_per_shard
     config.num_files_to_process = num_files
     config.total_steps = num_files * steps_per_shard
-    
+
     print(f"🎯 Конфигурация:")
     print(f"   Модель: {config.model_path}")
     print(f"   Файлов: {num_files}")
@@ -332,97 +326,102 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
     if DEVICE.type == "cuda":
         print(f"   GPU: {torch.cuda.get_device_name(0)}")
         print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    
+
     # Загрузка embedding модели
     engine = EmbeddingEngine(config.model_path, device=DEVICE.type)
-    
+
     # Авто-обновление input_dim из модели
     if config.input_dim != engine.dim:
         print(f"⚠️  Автообновление input_dim: {config.input_dim} → {engine.dim}")
         config.input_dim = engine.dim
-    
+
     # Создание моделей JEPA (все на GPU если доступно)
     encoder = TextJEPAEncoder(
         config.input_dim, config.hidden_dim, config.embed_dim,
-        config.num_layers, config.nhead, config.max_seq_len
+        config.num_layers, config.nhead, config.max_seq_len,
+        dropout=config.dropout
     ).to(DEVICE)
-    
+
     predictor = JEPAPredictor(
-        config.embed_dim, config.hidden_dim, config.num_layers, config.nhead
+        config.embed_dim, config.hidden_dim, config.num_layers, config.nhead,
+        max_seq_len=config.max_seq_len, dropout=config.dropout
     ).to(DEVICE)
-    
+
     target_encoder = TextJEPAEncoder(
         config.input_dim, config.hidden_dim, config.embed_dim,
-        config.num_layers, config.nhead, config.max_seq_len
+        config.num_layers, config.nhead, config.max_seq_len,
+        dropout=config.dropout
     ).to(DEVICE)
-    
+
     # Инициализация target encoder как копия encoder
     with torch.no_grad():
         for p, p_target in zip(encoder.parameters(), target_encoder.parameters()):
             p_target.data.copy_(p.data)
-    
+
     # Mask token (на том же устройстве)
-    mask_token = nn.Parameter(torch.randn(1, 1, config.input_dim, device=DEVICE) * 0.02)
-    
+    mask_token = nn.Parameter(
+        torch.randn(1, 1, config.input_dim, device=DEVICE) * config.mask_token_init_std
+    )
+
     # Оптимизатор
     params = list(encoder.parameters()) + list(predictor.parameters()) + [mask_token]
     optimizer = torch.optim.AdamW(params, lr=config.learning_rate, weight_decay=config.weight_decay)
-    
+
     # Scheduler (cosine annealing with warmup)
     def lr_lambda(step):
         if step < config.warmup_steps:
             return step / config.warmup_steps
         progress = (step - config.warmup_steps) / max(1, config.total_steps - config.warmup_steps)
         return max(0.0, 0.5 * (1 + np.cos(np.pi * progress)))
-    
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
+
     # Loss (с правильными весами для предотвращения коллапса)
     vicreg_loss = VICRegLoss(
         config.mse_weight, config.var_weight, config.cov_weight, config.vicreg_gamma
     )
-    
+
     # Восстановление из чекпоинта
     global_step = 0
     start_file_idx = 0
-    
+
     if resume_path and Path(resume_path).exists():
         print(f"\n🔄 Восстановление из {resume_path}")
         ckpt = torch.load(resume_path, map_location=DEVICE, weights_only=False)
-        
+
         encoder.load_state_dict(ckpt['context_encoder_state'])
         predictor.load_state_dict(ckpt['predictor_state'])
         target_encoder.load_state_dict(ckpt['target_encoder_state'])
         optimizer.load_state_dict(ckpt['optimizer_state'])
         scheduler.load_state_dict(ckpt['scheduler_state'])
         mask_token.data = ckpt['mask_token'].to(DEVICE)
-        
+
         global_step = ckpt.get('global_step', 0)
         start_file_idx = ckpt.get('shard_idx', 0) + 1
-        
+
         print(f"   Продолжаем с шарда {start_file_idx}, шаг {global_step}")
     else:
         print("\n🆕 Обучение с нуля")
-    
+
     # ==========================================
     # ГЕНЕРАЦИЯ СПИСКА ФАЙЛОВ (БЕЗ СКАЧИВАНИЯ)
     # ==========================================
-    print("\n🔍 Подготовка списка parquet-файлов HuggingFaceFW/fineweb-edu...")
+    print(f"\n🔍 Подготовка списка parquet-файлов {config.dataset_name}...")
     from huggingface_hub import hf_hub_download
-    
-    parquet_filenames = [f"sample/100BT/{i:03d}_00000.parquet" for i in range(num_files)]
+
+    parquet_filenames = get_parquet_filenames(num_files)
     print(f"✅ Будет обработано файлов: {len(parquet_filenames)}")
-    
+
     # Создание директорий
-    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
-    os.makedirs(SHARDS_DIR, exist_ok=True)
-    
+    os.makedirs(Config.checkpoint_dir, exist_ok=True)
+    os.makedirs(Config.shards_dir, exist_ok=True)
+
     # ==========================================
     # ОСНОВНОЙ ЦИКЛ (СКАЧИВАНИЕ ПО ОДНОМУ)
     # ==========================================
     for file_idx in range(start_file_idx, len(parquet_filenames)):
         parquet_filename = parquet_filenames[file_idx]
-        
+
         # ⬇️ СКАЧИВАЕМ ТОЛЬКО ОДИН ФАЙЛ ПЕРЕД ОБРАБОТКОЙ
         try:
             parquet_path = hf_hub_download(
@@ -434,16 +433,16 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
         except Exception as e:
             print(f"⚠️  Не удалось скачать {parquet_filename}: {e}")
             continue
-        
+
         print(f"\n{'='*70}")
         print(f"📥 ФАЙЛ {file_idx+1}/{len(parquet_filenames)}: {Path(parquet_path).name}")
         print(f"{'='*70}")
-        
+
         # Предвычисление эмбеддингов
         shard_path, mask_path = precompute_shard(
             parquet_path, config, engine, file_idx
         )
-        
+
         # Обучение на шарде
         print(f"\n📚 Загрузка шарда {file_idx}...")
         global_step = train_on_shard(
@@ -451,9 +450,9 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
             optimizer, scheduler, vicreg_loss, mask_token, config,
             global_step, file_idx
         )
-        
+
         # Сохранение чекпоинта
-        ckpt_path = os.path.join(CHECKPOINTS_DIR, f"jepa_shard_{file_idx:03d}.pt")
+        ckpt_path = os.path.join(Config.checkpoint_dir, f"jepa_shard_{file_idx:03d}.pt")
         torch.save({
             'context_encoder_state': encoder.state_dict(),
             'predictor_state': predictor.state_dict(),
@@ -468,7 +467,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
             'model_name': config.model_path,
         }, ckpt_path)
         print(f"\n💾 [ЧЕКПОИНТ] Шард {file_idx} → {ckpt_path}")
-        
+
         # Очистка временных файлов
         try:
             os.remove(shard_path)
@@ -476,7 +475,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
             print(f"   🗑  Шард удален (освобождено место)")
         except Exception:
             pass
-        
+
         if config.delete_parquet_after and Path(parquet_path).exists():
             try:
                 size_gb = Path(parquet_path).stat().st_size / 1e9
@@ -484,9 +483,9 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
                 print(f"   🗑  Parquet удален (освобождено {size_gb:.2f} GB)")
             except Exception:
                 pass
-        
+
         print(f"\n✅ Файл {file_idx+1} полностью обработан")
-    
+
     print(f"\n{'='*70}")
     print("🎉 STREAMING ОБУЧЕНИЕ ЗАВЕРШЕНО!")
     print(f"{'='*70}")
@@ -497,12 +496,12 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
 # ==========================================
 def main():
     parser = argparse.ArgumentParser(description="Streaming обучение Text-JEPA")
-    parser.add_argument("--num-files", type=int, default=10)
-    parser.add_argument("--examples-per-file", type=int, default=5000)
-    parser.add_argument("--steps-per-shard", type=int, default=500)
+    parser.add_argument("--num-files", type=int, default=Config.num_files_to_process)
+    parser.add_argument("--examples-per-file", type=int, default=Config.examples_per_file)
+    parser.add_argument("--steps-per-shard", type=int, default=Config.steps_per_shard)
     parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
-    
+
     config = Config()
     streaming_train(
         config, args.num_files, args.examples_per_file,
@@ -512,3 +511,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
