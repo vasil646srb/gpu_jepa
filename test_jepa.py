@@ -43,10 +43,14 @@ def load_models():
 
     # Загрузка базовой embedding модели (SentenceTransformers, как в обучении)
     print(f"📦 Загрузка embedding модели: {Config.model_path}")
-    st_model = SentenceTransformer(Config.model_path, device=DEVICE.type, trust_remote_code=True)
+    # Загружаем на CPU чтобы не конфликтовать с JEPA на GPU (OOM)
+    st_model = SentenceTransformer(Config.model_path, device='cpu', trust_remote_code=True)
     tokenizer = st_model.tokenizer
     transformer = st_model[0].auto_model
+    transformer = transformer.to('cpu')
+    transformer.eval()
     max_len = getattr(st_model, 'max_seq_length', Config.max_seq_len)
+    print(f"   💻 Transformer на CPU (JEPA на GPU)")
 
     config = Config()
     encoder = TextJEPAEncoder(
@@ -76,7 +80,7 @@ def load_models():
 
 def get_embeddings(texts, tokenizer, transformer, max_len, encoder, config):
     """Получает JEPA-эмбеддинги для списка текстов."""
-    # Токенизируем
+    # Токенизируем на CPU
     inputs = tokenizer(
         texts,
         padding='max_length',
@@ -84,9 +88,9 @@ def get_embeddings(texts, tokenizer, transformer, max_len, encoder, config):
         max_length=max_len,
         return_tensors="pt"
     )
-    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+    inputs = {k: v.to('cpu') for k, v in inputs.items()}
 
-    # Получаем эмбеддинги токенов
+    # Получаем эмбеддинги токенов на CPU
     with torch.no_grad():
         outputs = transformer(**inputs)
         x = outputs.last_hidden_state.float()
@@ -94,10 +98,18 @@ def get_embeddings(texts, tokenizer, transformer, max_len, encoder, config):
     # Маска паддинга
     key_padding_mask = (inputs["attention_mask"] == 0)
 
+    # Переносим на GPU для JEPA
+    x = x.to(DEVICE)
+    key_padding_mask = key_padding_mask.to(DEVICE)
+
     # JEPA encoder
     with torch.no_grad():
         _, pooled_repr = encoder(x, key_padding_mask)
         pooled_repr = F.normalize(pooled_repr, p=2, dim=-1)
+
+    # Очищаем GPU
+    del x, key_padding_mask, outputs
+    torch.cuda.empty_cache()
 
     return pooled_repr.cpu().numpy()
 
