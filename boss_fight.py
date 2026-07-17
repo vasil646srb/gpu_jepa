@@ -11,6 +11,73 @@ from config import Config, DEVICE
 from models import TextJEPAEncoder
 
 
+# ==========================================
+# ПРЕДВЫЧИСЛЕНИЕ ЭМБЕДДИНГОВ НА GPU
+# ==========================================
+class EmbeddingCache:
+    """Кэширует эмбеддинги текстов в RAM (GPU)."""
+
+    def __init__(self, model_path, device='cuda'):
+        print(f"📦 Загрузка embedding модели: {model_path}")
+        self.device = device
+        self.st_model = SentenceTransformer(model_path, device=device, trust_remote_code=True)
+        self.tokenizer = self.st_model.tokenizer
+        self.transformer = self.st_model[0].auto_model
+
+        raw_max_len = getattr(self.st_model, 'max_seq_length', Config.max_seq_len)
+        self.max_len = min(raw_max_len, Config.max_seq_len)
+        print(f"   📐 max_seq_length (raw): {raw_max_len} → capped: {self.max_len}")
+        print(f"   ✅ Модель загружена на {device}")
+
+        self._cache = {}  # text -> (x_tensor, mask_tensor) on GPU
+
+    def _compute(self, texts):
+        inputs = self.tokenizer(
+            texts,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_len,
+            return_tensors="pt"
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = self.transformer(**inputs)
+            x = outputs.last_hidden_state.float()
+        mask = (inputs["attention_mask"] == 0)
+        return x, mask
+
+    def get(self, texts):
+        new_texts = [t for t in texts if t not in self._cache]
+        if new_texts:
+            batch_size = 32
+            for i in range(0, len(new_texts), batch_size):
+                batch = new_texts[i:i + batch_size]
+                x, mask = self._compute(batch)
+                for j, txt in enumerate(batch):
+                    self._cache[txt] = (x[j:j+1], mask[j:j+1])
+        xs, masks = [], []
+        for t in texts:
+            x, m = self._cache[t]
+            xs.append(x)
+            masks.append(m)
+        return torch.cat(xs, dim=0), torch.cat(masks, dim=0)
+
+    def get_jepa_embeddings(self, texts, encoder):
+        x, mask = self.get(texts)
+        with torch.no_grad():
+            _, pooled = encoder(x, mask)
+            pooled = F.normalize(pooled, p=2, dim=-1)
+        return pooled.cpu().numpy()
+
+    def clear_cache(self):
+        self._cache.clear()
+        torch.cuda.empty_cache()
+        print("🗑  Кэш очищен")
+
+
+# ==========================================
+# ЗАГРУЗКА МОДЕЛЕЙ
+# ==========================================
 def load_jepa():
     config = Config()
     encoder = TextJEPAEncoder(
@@ -19,7 +86,6 @@ def load_jepa():
         dropout=config.dropout
     ).to(DEVICE)
 
-    # Ищем последний чекпоинт
     ckpts = sorted(Path(Config.boss_checkpoint_dir).glob(Config.boss_checkpoint_pattern))
     if not ckpts:
         print("❌ Чекпоинты не найдены!"); sys.exit(1)
@@ -29,64 +95,15 @@ def load_jepa():
     encoder.eval()
     print(f"✅ Загружен чекпоинт JEPA: {ckpts[-1].name}\n")
 
-    # Загрузка базовой модели через SentenceTransformer
-    print(f"📦 Загрузка embedding модели: {config.model_path}")
-    st_model = SentenceTransformer(config.model_path, device='cpu', trust_remote_code=True)
-    tokenizer = st_model.tokenizer
-    transformer = st_model[0].auto_model
-    max_len = getattr(st_model, 'max_seq_length', config.max_seq_len)
-
-    # Переносим transformer на CPU чтобы не конфликтовать с JEPA на GPU
-    transformer = transformer.to('cpu')
-    transformer.eval()
-
-    print(f"   💻 Transformer на CPU (JEPA на GPU)")
-
-    return encoder, tokenizer, transformer, max_len, config
-
-
-def get_emb(texts, encoder, tokenizer, transformer, max_len, config):
-    # Токенизируем на CPU
-    inputs = tokenizer(
-        texts,
-        padding='max_length',
-        truncation=True,
-        max_length=max_len,
-        return_tensors="pt"
-    )
-    inputs = {k: v.to('cpu') for k, v in inputs.items()}
-
-    # Получаем эмбеддинги токенов на CPU
-    with torch.no_grad():
-        outputs = transformer(**inputs)
-        x = outputs.last_hidden_state.float()
-
-    # Маска паддинга
-    mask = (inputs["attention_mask"] == 0)
-
-    # Переносим на GPU для JEPA
-    x = x.to(DEVICE)
-    mask = mask.to(DEVICE)
-
-    with torch.no_grad():
-        out = encoder(x, mask)
-        if isinstance(out, tuple):
-            _, pooled = out
-        else:
-            pooled = out
-
-    # Очищаем GPU
-    del x, mask, out
-    torch.cuda.empty_cache()
-
-    return F.normalize(pooled, p=2, dim=-1).cpu().numpy()
+    cache = EmbeddingCache(config.model_path, device=DEVICE.type)
+    return cache, encoder, config
 
 
 def sim(a, b): return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9)
 
 
 def main():
-    encoder, tokenizer, transformer, max_len, config = load_jepa()
+    cache, encoder, config = load_jepa()
 
     print("=" * 60)
     print("🥊 BOSS FIGHT: Тестирование глубинного понимания JEPA")
@@ -95,68 +112,75 @@ def main():
     # Тест 1
     t1a = "The company reported record profits this quarter, leading to a massive expansion of their global workforce."
     t1b = "The company reported record losses this quarter, leading to a massive reduction of their global workforce."
-    e1 = get_emb([t1a, t1b], encoder, tokenizer, transformer, max_len, config)
+    cache.get([t1a, t1b])
+    e1 = cache.get_jepa_embeddings([t1a, t1b], encoder)
     s1 = sim(e1[0], e1[1])
     thr1 = Config.boss_test1_threshold
     print(f"\n🧪 Тест 1: Лексическая ловушка (Антонимы)")
     print(f"   Схожесть: {s1:.3f} (Ожидается: < {thr1})")
-    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель видит смысл, а не слова)' if s1 < thr1 else '❌ ПРОВАЛ (Модель ослеплена общими словами)'}")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН' if s1 < thr1 else '❌ ПРОВАЛ'}")
 
     # Тест 2
     t2a = "A virus injects its genetic material into a host cell, hijacking the replication machinery to produce more viruses."
     t2b = "A computer worm infiltrates a network, exploiting system vulnerabilities to execute payloads and replicate across nodes."
-    e2 = get_emb([t2a, t2b], encoder, tokenizer, transformer, max_len, config)
+    cache.get([t2a, t2b])
+    e2 = cache.get_jepa_embeddings([t2a, t2b], encoder)
     s2 = sim(e2[0], e2[1])
     thr2 = Config.boss_test2_threshold
     print(f"\n🧪 Тест 2: Кросс-доменная абстракция")
     print(f"   Схожесть: {s2:.3f} (Ожидается: > {thr2})")
-    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель поняла структурную аналогию)' if s2 > thr2 else '❌ ПРОВАЛ (Модель не видит скрытых паттернов)'}")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН' if s2 > thr2 else '❌ ПРОВАЛ'}")
 
     # Тест 3
     q3 = "How to avoid flooding in an underground storage space?"
     d3_good = "Installing a sump pump and applying waterproof sealants to concrete walls are essential steps for maintaining a dry basement."
     d3_bad = "Flooding can easily destroy an underground storage space if water levels rise too quickly."
-    e3 = get_emb([q3, d3_good, d3_bad], encoder, tokenizer, transformer, max_len, config)
+    cache.get([q3, d3_good, d3_bad])
+    e3 = cache.get_jepa_embeddings([q3, d3_good, d3_bad], encoder)
     s3_good = sim(e3[0], e3[1])
     s3_bad = sim(e3[0], e3[2])
     print(f"\n🧪 Тест 3: Асимметричный интент")
     print(f"   Запрос -> Смысловой док: {s3_good:.3f}")
     print(f"   Запрос -> Лексический док: {s3_bad:.3f}")
-    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель понимает цель запроса)' if s3_good > s3_bad else '❌ ПРОВАЛ (Модель работает как поиск по ключевым словам)'}")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН' if s3_good > s3_bad else '❌ ПРОВАЛ'}")
 
     # Тест 4
     t4a = "The new software update significantly improved the system's performance, making it highly stable."
     t4b = "The new software update failed to improve the system's performance, making it highly unstable."
-    e4 = get_emb([t4a, t4b], encoder, tokenizer, transformer, max_len, config)
+    cache.get([t4a, t4b])
+    e4 = cache.get_jepa_embeddings([t4a, t4b], encoder)
     s4 = sim(e4[0], e4[1])
     thr4 = Config.boss_test4_threshold
     print(f"\n🧪 Тест 4: Ловушка отрицания")
     print(f"   Схожесть: {s4:.3f} (Ожидается: < {thr4})")
-    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель чувствует инверсию смысла)' if s4 < thr4 else '❌ ПРОВАЛ (Отрицание проигнорировано)'}")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН' if s4 < thr4 else '❌ ПРОВАЛ'}")
 
     # Тест 5
     t5a = "The engineer refactored the legacy codebase, removing redundant loops and fixing the race condition that caused intermittent crashes."
     t5b = "The engineer introduced a race condition into the codebase by adding redundant loops, causing the application to crash intermittently."
-    e5 = get_emb([t5a, t5b], encoder, tokenizer, transformer, max_len, config)
+    cache.get([t5a, t5b])
+    e5 = cache.get_jepa_embeddings([t5a, t5b], encoder)
     s5 = sim(e5[0], e5[1])
     thr5 = Config.boss_test5_threshold
     print(f"\n🧪 Тест 5: Программирование (Исправление бага vs внесение бага)")
     print(f"   Схожесть: {s5:.3f} (Ожидается: < {thr5})")
-    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель различает fix и bug при почти одинаковой лексике)' if s5 < thr5 else '❌ ПРОВАЛ (Модель не различает исправление и внесение бага)'}")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН' if s5 < thr5 else '❌ ПРОВАЛ'}")
 
     # Тест 6
     q6 = "Has the project plan been successfully implemented on schedule?"
     d6_good = "The team completed all milestones of the roadmap ahead of deadline and deployed the final release to production."
     d6_bad = "The project plan outlines the milestones, deliverables, and timeline for the upcoming quarter."
-    e6 = get_emb([q6, d6_good, d6_bad], encoder, tokenizer, transformer, max_len, config)
+    cache.get([q6, d6_good, d6_bad])
+    e6 = cache.get_jepa_embeddings([q6, d6_good, d6_bad], encoder)
     s6_good = sim(e6[0], e6[1])
     s6_bad = sim(e6[0], e6[2])
     print(f"\n🧪 Тест 6: Реализация плана проекта (План vs Факт исполнения)")
     print(f"   Запрос -> Отчёт о реализации: {s6_good:.3f}")
     print(f"   Запрос -> Просто описание плана: {s6_bad:.3f}")
-    print(f"   Вердикт: {'✅ ПРОЙДЕН (Модель отличает выполненный план от просто описания плана)' if s6_good > s6_bad else '❌ ПРОВАЛ (Модель не различает стадию планирования и стадию реализации)'}")
+    print(f"   Вердикт: {'✅ ПРОЙДЕН' if s6_good > s6_bad else '❌ ПРОВАЛ'}")
 
     print("\n" + "=" * 60)
+    cache.clear_cache()
 
 
 if __name__ == "__main__":
