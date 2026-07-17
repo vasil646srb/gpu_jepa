@@ -29,18 +29,24 @@ def load_jepa():
     encoder.eval()
     print(f"✅ Загружен чекпоинт JEPA: {ckpts[-1].name}\n")
 
-    # Загрузка базовой модели через SentenceTransformer (вместо ONNX)
+    # Загрузка базовой модели через SentenceTransformer
     print(f"📦 Загрузка embedding модели: {config.model_path}")
-    st_model = SentenceTransformer(config.model_path, device=DEVICE.type, trust_remote_code=True)
+    st_model = SentenceTransformer(config.model_path, device='cpu', trust_remote_code=True)
     tokenizer = st_model.tokenizer
     transformer = st_model[0].auto_model
     max_len = getattr(st_model, 'max_seq_length', config.max_seq_len)
+
+    # Переносим transformer на CPU чтобы не конфликтовать с JEPA на GPU
+    transformer = transformer.to('cpu')
+    transformer.eval()
+
+    print(f"   💻 Transformer на CPU (JEPA на GPU)")
 
     return encoder, tokenizer, transformer, max_len, config
 
 
 def get_emb(texts, encoder, tokenizer, transformer, max_len, config):
-    # Токенизируем (точно так же, как в train_streaming.py)
+    # Токенизируем на CPU
     inputs = tokenizer(
         texts,
         padding='max_length',
@@ -48,29 +54,35 @@ def get_emb(texts, encoder, tokenizer, transformer, max_len, config):
         max_length=max_len,
         return_tensors="pt"
     )
-    inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+    inputs = {k: v.to('cpu') for k, v in inputs.items()}
 
-    # Получаем эмбеддинги токенов (last_hidden_state)
+    # Получаем эмбеддинги токенов на CPU
     with torch.no_grad():
         outputs = transformer(**inputs)
         x = outputs.last_hidden_state.float()
 
-    # Маска паддинга (True там, где паддинг, как требует key_padding_mask в PyTorch)
+    # Маска паддинга
     mask = (inputs["attention_mask"] == 0)
+
+    # Переносим на GPU для JEPA
+    x = x.to(DEVICE)
+    mask = mask.to(DEVICE)
 
     with torch.no_grad():
         out = encoder(x, mask)
-        # Поддержка разного формата возврата (кортеж или один тензор)
         if isinstance(out, tuple):
             _, pooled = out
         else:
             pooled = out
 
+    # Очищаем GPU
+    del x, mask, out
+    torch.cuda.empty_cache()
+
     return F.normalize(pooled, p=2, dim=-1).cpu().numpy()
 
 
-def sim(a, b):
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9)
+def sim(a, b): return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9)
 
 
 def main():
