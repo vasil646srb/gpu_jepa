@@ -182,6 +182,12 @@ class Config:
     file_process_mode = TrainConfig.file_process_mode
     use_amp = TrainConfig.use_amp
     amp_dtype = TrainConfig.amp_dtype
+    num_workers = TrainConfig.num_workers
+    pin_memory = TrainConfig.pin_memory
+    drop_last = TrainConfig.drop_last
+    embedding_backend = TrainConfig.embedding_backend
+    embedding_max_length = TrainConfig.embedding_max_length
+    embedding_encode_batch = TrainConfig.embedding_encode_batch
 
     ema_tau = JEPAConfig.ema_tau
     mse_weight = JEPAConfig.mse_weight
