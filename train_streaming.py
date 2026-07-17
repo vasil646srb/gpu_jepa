@@ -100,8 +100,8 @@ def precompute_shard_fixed(parquet_path, config, engine, shard_idx):
     import pyarrow.parquet as pq
 
     print(f"\n🔧 [FIXED MODE] Предвычисление эмбеддингов ({engine.device})...")
-    table = pq.read_table(parquet_path, columns=[Config.parquet_column])
-    texts = table[Config.parquet_column].to_pylist()[:config.examples_per_file]
+    table = pq.read_table(parquet_path, columns=[Config.text_column])
+    texts = table[Config.text_column].to_pylist()[:config.examples_per_file]
     texts = [t for t in texts if isinstance(t, str) and len(t.strip()) > Config.min_text_length]
 
     if not texts:
@@ -168,9 +168,9 @@ def precompute_shard_full(parquet_path, config, engine, file_idx):
 
     for batch in parquet_file.iter_batches(
         batch_size=batch_size,
-        columns=[Config.parquet_column]
+        columns=[Config.text_column]
     ):
-        texts = batch[Config.parquet_column].to_pylist()
+        texts = batch[Config.text_column].to_pylist()
         texts = [t for t in texts if isinstance(t, str) and len(t.strip()) > Config.min_text_length]
         current_texts.extend(texts)
         rows_processed += len(texts)

@@ -123,6 +123,7 @@ class DatasetConfig:
     min_text_length = 10
     max_text_length = 1024
     text_column = "text"
+    parquet_column = "text"  # alias для обратной совместимости
     total_examples = 0
     parquet_files_pattern = "sample/100BT/{i:03d}_00000.parquet"
 
@@ -210,6 +211,7 @@ class Config:
     min_text_length = DatasetConfig.min_text_length
     max_text_length = DatasetConfig.max_text_length
     text_column = DatasetConfig.text_column
+    parquet_column = DatasetConfig.parquet_column
     total_examples = DatasetConfig.total_examples
     parquet_files_pattern = DatasetConfig.parquet_files_pattern
 
