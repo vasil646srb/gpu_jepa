@@ -3,13 +3,12 @@
 - Поддержка любых embedding моделей
 - AMP (bfloat16) для ускорения на GPU
 - Streaming pipeline: скачивание → инференс → обучение → удаление
-- Режимы: fixed (N примеров) или full (весь файл, multiple shards)
+- Режимы: fixed (N примеров) или full (весь файл, потоково)
 """
 import os
 import sys
 import argparse
 import time
-import shutil
 from pathlib import Path
 import numpy as np
 import torch
@@ -65,7 +64,7 @@ class EmbeddingEngine:
 
     def _detect_dim(self) -> int:
         test_emb = self.encode(["test sentence"], batch_size=1)
-        return test_emb.shape[-1]  # hidden_dim, not seq_len!
+        return test_emb.shape[-1]
 
     def encode(self, texts, batch_size=8, max_length=None, **kwargs):
         all_embs = []
@@ -93,7 +92,7 @@ class EmbeddingEngine:
 
 
 # ==========================================
-# ПРЕДВЫЧИСЛЕНИЕ: FIXED MODE (как раньше)
+# ПРЕДВЫЧИСЛЕНИЕ: FIXED MODE
 # ==========================================
 def precompute_shard_fixed(parquet_path, config, engine, shard_idx):
     """Предвычисляет эмбеддинги: только первые examples_per_file примеров."""
@@ -135,19 +134,43 @@ def precompute_shard_fixed(parquet_path, config, engine, shard_idx):
 
 
 # ==========================================
-# ПРЕДВЫЧИСЛЕНИЕ: FULL MODE (весь файл, multiple shards)
+# ПОТОКОВАЯ ОБРАБОТКА: FULL MODE
 # ==========================================
-def precompute_shard_full(parquet_path, config, engine, file_idx):
+def _create_shard(texts, config, engine, shard_idx):
+    """Создаёт один шард из списка текстов."""
+    all_embeddings = []
+    for i in range(0, len(texts), Config.parquet_batch_size):
+        batch_texts = texts[i:i+Config.parquet_batch_size]
+        embeddings_np = engine.encode(
+            batch_texts,
+            batch_size=min(len(batch_texts), Config.embedding_encode_batch),
+            max_length=config.max_seq_len
+        )
+        all_embeddings.append(embeddings_np)
+
+    embeddings = np.concatenate(all_embeddings, axis=0)
+    masks = np.zeros((len(embeddings), config.max_seq_len), dtype=bool)
+
+    shard_path = os.path.join(Config.shards_dir, f"shard_{shard_idx:05d}.npy")
+    mask_path = os.path.join(Config.shards_dir, f"mask_{shard_idx:05d}.npy")
+    np.save(shard_path, embeddings)
+    np.save(mask_path, masks)
+    print(f"   💾 Шард {shard_idx}: {len(embeddings):,} примеров")
+    return shard_path, mask_path
+
+
+def process_parquet_streaming(parquet_path, config, engine, file_idx,
+                               encoder, predictor, target_encoder,
+                               optimizer, scheduler, vicreg_loss, mask_token,
+                               global_step):
     """
-    Предвычисляет эмбеддинги из ВСЕГО parquet-файла.
-    Создаёт multiple shards по config.shard_size примеров каждый.
-    Возвращает список (shard_path, mask_path).
+    Обрабатывает parquet-файл потоково: читает chunk → создаёт шард → обучает → удаляет.
+    Не хранит все шарды на диске одновременно.
     """
     import pyarrow.parquet as pq
 
-    print(f"\n🔧 [FULL MODE] Обработка всего файла: {Path(parquet_path).name}")
+    print(f"\n🔧 [FULL MODE] Потоковая обработка: {Path(parquet_path).name}")
 
-    # Читаем метаданные без загрузки данных
     parquet_file = pq.ParquetFile(parquet_path)
     total_rows = parquet_file.metadata.num_rows
     print(f"   📊 Всего строк в файле: {total_rows:,}")
@@ -156,18 +179,15 @@ def precompute_shard_full(parquet_path, config, engine, file_idx):
     print(f"   🎯 Оценка шардов: ~{estimated_shards}")
 
     os.makedirs(Config.shards_dir, exist_ok=True)
+    os.makedirs(Config.checkpoint_dir, exist_ok=True)
 
-    shard_paths = []
     current_texts = []
-    current_count = 0
-    shard_idx = file_idx * 1000  # offset для уникальности
-
-    # Читаем parquet батчами (потоково, без загрузки всего файла в RAM)
-    batch_size = Config.parquet_batch_size
+    shard_idx = file_idx * 1000
     rows_processed = 0
+    shards_trained = 0
 
     for batch in parquet_file.iter_batches(
-        batch_size=batch_size,
+        batch_size=Config.parquet_batch_size,
         columns=[Config.text_column]
     ):
         texts = batch[Config.text_column].to_pylist()
@@ -175,61 +195,89 @@ def precompute_shard_full(parquet_path, config, engine, file_idx):
         current_texts.extend(texts)
         rows_processed += len(texts)
 
-        # Когда накопили достаточно для шарда — обрабатываем
+        # Когда накопили достаточно для шарда — обрабатываем сразу
         while len(current_texts) >= config.shard_size:
             shard_texts = current_texts[:config.shard_size]
             current_texts = current_texts[config.shard_size:]
 
-            # Предвычисляем эмбеддинги для шарда
-            all_embeddings = []
-            for i in range(0, len(shard_texts), Config.parquet_batch_size):
-                batch_texts = shard_texts[i:i+Config.parquet_batch_size]
-                embeddings_np = engine.encode(
-                    batch_texts,
-                    batch_size=min(len(batch_texts), Config.embedding_encode_batch),
-                    max_length=config.max_seq_len
-                )
-                all_embeddings.append(embeddings_np)
+            # 1. Создаём шард
+            shard_path, mask_path = _create_shard(shard_texts, config, engine, shard_idx)
 
-            embeddings = np.concatenate(all_embeddings, axis=0)
-            masks = np.zeros((len(embeddings), config.max_seq_len), dtype=bool)
+            # 2. Обучаем на шарде
+            print(f"\n📚 Обучение на шарде {shard_idx}...")
+            global_step = train_on_shard(
+                shard_path, mask_path, encoder, predictor, target_encoder,
+                optimizer, scheduler, vicreg_loss, mask_token, config,
+                global_step, shard_idx
+            )
 
-            shard_path = os.path.join(Config.shards_dir, f"shard_{shard_idx:05d}.npy")
-            mask_path = os.path.join(Config.shards_dir, f"mask_{shard_idx:05d}.npy")
-            np.save(shard_path, embeddings)
-            np.save(mask_path, masks)
-            shard_paths.append((shard_path, mask_path))
+            # 3. Сохраняем чекпоинт
+            ckpt_path = os.path.join(Config.checkpoint_dir, f"jepa_shard_{shard_idx:05d}.pt")
+            torch.save({
+                'context_encoder_state': encoder.state_dict(),
+                'predictor_state': predictor.state_dict(),
+                'target_encoder_state': target_encoder.state_dict(),
+                'optimizer_state': optimizer.state_dict(),
+                'scheduler_state': scheduler.state_dict(),
+                'mask_token': mask_token.data,
+                'global_step': global_step,
+                'shard_idx': shard_idx,
+                'input_dim': config.input_dim,
+                'embed_dim': config.embed_dim,
+                'model_name': config.model_path,
+            }, ckpt_path)
+            print(f"💾 [ЧЕКПОИНТ] Шард {shard_idx} → {ckpt_path}")
 
-            print(f"   💾 Шард {shard_idx}: {len(embeddings):,} примеров → {Path(shard_path).name}")
+            # 4. Удаляем шард
+            try:
+                os.remove(shard_path)
+                os.remove(mask_path)
+                print(f"🗑  Шард {shard_idx} удалён")
+            except Exception:
+                pass
+
+            shards_trained += 1
             shard_idx += 1
 
         if rows_processed % 50000 == 0:
-            print(f"   📊 Прогресс: {rows_processed:,}/{total_rows:,} строк обработано")
+            print(f"   📊 Прогресс: {rows_processed:,}/{total_rows:,} строк, {shards_trained} шардов обучено")
 
-    # Обрабатываем остаток (если есть)
+    # Обрабатываем остаток
     if current_texts:
-        all_embeddings = []
-        for i in range(0, len(current_texts), Config.parquet_batch_size):
-            batch_texts = current_texts[i:i+Config.parquet_batch_size]
-            embeddings_np = engine.encode(
-                batch_texts,
-                batch_size=min(len(batch_texts), Config.embedding_encode_batch),
-                max_length=config.max_seq_len
-            )
-            all_embeddings.append(embeddings_np)
+        shard_path, mask_path = _create_shard(current_texts, config, engine, shard_idx)
+        print(f"\n📚 Обучение на финальном шарде {shard_idx}...")
+        global_step = train_on_shard(
+            shard_path, mask_path, encoder, predictor, target_encoder,
+            optimizer, scheduler, vicreg_loss, mask_token, config,
+            global_step, shard_idx
+        )
 
-        embeddings = np.concatenate(all_embeddings, axis=0)
-        masks = np.zeros((len(embeddings), config.max_seq_len), dtype=bool)
+        ckpt_path = os.path.join(Config.checkpoint_dir, f"jepa_shard_{shard_idx:05d}.pt")
+        torch.save({
+            'context_encoder_state': encoder.state_dict(),
+            'predictor_state': predictor.state_dict(),
+            'target_encoder_state': target_encoder.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'scheduler_state': scheduler.state_dict(),
+            'mask_token': mask_token.data,
+            'global_step': global_step,
+            'shard_idx': shard_idx,
+            'input_dim': config.input_dim,
+            'embed_dim': config.embed_dim,
+            'model_name': config.model_path,
+        }, ckpt_path)
+        print(f"💾 [ЧЕКПОИНТ] Шард {shard_idx} → {ckpt_path}")
 
-        shard_path = os.path.join(Config.shards_dir, f"shard_{shard_idx:05d}.npy")
-        mask_path = os.path.join(Config.shards_dir, f"mask_{shard_idx:05d}.npy")
-        np.save(shard_path, embeddings)
-        np.save(mask_path, masks)
-        shard_paths.append((shard_path, mask_path))
-        print(f"   💾 Финальный шард {shard_idx}: {len(embeddings):,} примеров")
+        try:
+            os.remove(shard_path)
+            os.remove(mask_path)
+        except Exception:
+            pass
 
-    print(f"\n✅ Файл обработан: {len(shard_paths)} шардов создано, {rows_processed:,} примеров")
-    return shard_paths
+        shards_trained += 1
+
+    print(f"\n✅ Файл обработан: {shards_trained} шардов обучено, {rows_processed:,} примеров")
+    return global_step
 
 
 # ==========================================
@@ -467,44 +515,14 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
         print(f"📥 ФАЙЛ {file_idx+1}/{len(parquet_filenames)}: {Path(parquet_path).name}")
         print(f"{'='*70}")
 
-        # Выбираем режим обработки
         if config.file_process_mode == "full":
-            # FULL MODE: обрабатываем весь файл, создаём multiple shards
-            shard_paths = precompute_shard_full(parquet_path, config, engine, file_idx)
-
-            for shard_idx, (shard_path, mask_path) in enumerate(shard_paths):
-                actual_shard_idx = file_idx * 1000 + shard_idx
-                print(f"\n📚 Загрузка шарда {actual_shard_idx}...")
-                global_step = train_on_shard(
-                    shard_path, mask_path, encoder, predictor, target_encoder,
-                    optimizer, scheduler, vicreg_loss, mask_token, config,
-                    global_step, actual_shard_idx
-                )
-
-                # Сохранение чекпоинта после каждого шарда
-                ckpt_path = os.path.join(Config.checkpoint_dir, f"jepa_shard_{actual_shard_idx:05d}.pt")
-                torch.save({
-                    'context_encoder_state': encoder.state_dict(),
-                    'predictor_state': predictor.state_dict(),
-                    'target_encoder_state': target_encoder.state_dict(),
-                    'optimizer_state': optimizer.state_dict(),
-                    'scheduler_state': scheduler.state_dict(),
-                    'mask_token': mask_token.data,
-                    'global_step': global_step,
-                    'shard_idx': actual_shard_idx,
-                    'input_dim': config.input_dim,
-                    'embed_dim': config.embed_dim,
-                    'model_name': config.model_path,
-                }, ckpt_path)
-                print(f"\n💾 [ЧЕКПОИНТ] Шард {actual_shard_idx} → {ckpt_path}")
-
-                # Очистка шарда
-                try:
-                    os.remove(shard_path)
-                    os.remove(mask_path)
-                except Exception:
-                    pass
-
+            # FULL MODE: потоковая обработка — шард за шардом
+            global_step = process_parquet_streaming(
+                parquet_path, config, engine, file_idx,
+                encoder, predictor, target_encoder,
+                optimizer, scheduler, vicreg_loss, mask_token,
+                global_step
+            )
         else:
             # FIXED MODE: как раньше, только первые N примеров
             shard_path, mask_path = precompute_shard_fixed(
@@ -580,3 +598,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
