@@ -30,7 +30,10 @@ class EmbeddingCache:
         self.st_model = SentenceTransformer(model_path, device=device, trust_remote_code=True)
         self.tokenizer = self.st_model.tokenizer
         self.transformer = self.st_model[0].auto_model
-        self.max_len = getattr(self.st_model, 'max_seq_length', Config.max_seq_len)
+        raw_max_len = getattr(self.st_model, 'max_seq_length', Config.max_seq_len)
+        # Ограничиваем до разумного значения (как в обучении) чтобы не OOM
+        self.max_len = min(raw_max_len, Config.max_seq_len)
+        print(f"   📐 max_seq_length (raw): {raw_max_len} → capped: {self.max_len}")
         self._cache = {}  # text -> (x_tensor, mask_tensor) on GPU
         print(f"   ✅ Модель загружена на {device}")
         print(f"   📐 max_seq_length: {self.max_len}")
