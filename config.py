@@ -15,6 +15,7 @@ os.environ["HF_HUB_ETAG_TIMEOUT"] = "500"
 os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "500"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*nested tensors.*")
 warnings.filterwarnings("ignore", message=".*TracerWarning.*")
@@ -65,7 +66,7 @@ class TrainConfig:
 
     # Шарды и потоковая загрузка
     steps_per_shard = 1000
-    parquet_batch_size = 2000
+    parquet_batch_size = 1000
     shard_size = 10000
     num_files_to_process = 10
     examples_per_file = 10000

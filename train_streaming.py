@@ -63,11 +63,17 @@ class EmbeddingEngine:
         print(f"   🎯 Backend: Sentence-Transformers")
 
     def _detect_dim(self) -> int:
-        test_emb = self.encode(["test sentence"], batch_size=1)
+        test_emb, test_mask = self.encode(["test sentence"], batch_size=1)
         return test_emb.shape[-1]
 
     def encode(self, texts, batch_size=8, max_length=None, **kwargs):
+        """
+        Возвращает (embeddings, attention_mask).
+        embeddings: [num_texts, seq_len, hidden_dim]
+        attention_mask: [num_texts, seq_len] (1=валидный, 0=padding)
+        """
         all_embs = []
+        all_masks = []
         tokenizer = self.model.tokenizer
         transformer = self.model[0].auto_model
         max_len = max_length if max_length is not None else getattr(self.model, 'max_seq_length', 128)
@@ -87,8 +93,11 @@ class EmbeddingEngine:
                 outputs = transformer(**inputs)
                 embs = outputs.last_hidden_state
                 all_embs.append(embs.cpu())
+                all_masks.append(inputs['attention_mask'].cpu())
 
-        return torch.cat(all_embs, dim=0).float().numpy()
+        embeddings = torch.cat(all_embs, dim=0).float().numpy()
+        attention_mask = torch.cat(all_masks, dim=0).numpy()
+        return embeddings, attention_mask
 
 
 # ==========================================
@@ -111,24 +120,28 @@ def precompute_shard_fixed(parquet_path, config, engine, shard_idx):
     mask_path = os.path.join(Config.shards_dir, f"mask_{shard_idx:03d}.npy")
 
     all_embeddings = []
+    all_attention_masks = []
     batch_size = Config.parquet_batch_size
 
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i+batch_size]
-        embeddings_np = engine.encode(
+        embeddings_np, attention_mask = engine.encode(
             batch_texts,
             batch_size=min(batch_size, Config.embedding_encode_batch),
             max_length=config.max_seq_len
         )
         all_embeddings.append(embeddings_np)
+        all_attention_masks.append(attention_mask)
         if (i // batch_size) % 10 == 0:
             print(f"   📊 Обработано: {min(i+batch_size, len(texts))}/{len(texts)}")
 
     embeddings = np.concatenate(all_embeddings, axis=0)
-    masks = np.zeros((len(embeddings), config.max_seq_len), dtype=bool)
+    attention_masks = np.concatenate(all_attention_masks, axis=0)
+    # key_padding_mask = True для padding (attention_mask == 0)
+    key_padding_mask = (attention_masks == 0)
 
     np.save(shard_path, embeddings)
-    np.save(mask_path, masks)
+    np.save(mask_path, key_padding_mask)
     print(f"   💾 Шард создан: {len(embeddings)} примеров → {shard_path}")
     return shard_path, mask_path
 
@@ -137,24 +150,27 @@ def precompute_shard_fixed(parquet_path, config, engine, shard_idx):
 # ПОТОКОВАЯ ОБРАБОТКА: FULL MODE
 # ==========================================
 def _create_shard(texts, config, engine, shard_idx):
-    """Создаёт один шард из списка текстов."""
+    """Создаёт один шард из списка текстов. Возвращает (shard_path, mask_path)."""
     all_embeddings = []
+    all_attention_masks = []
     for i in range(0, len(texts), Config.parquet_batch_size):
         batch_texts = texts[i:i+Config.parquet_batch_size]
-        embeddings_np = engine.encode(
+        embeddings_np, attention_mask = engine.encode(
             batch_texts,
             batch_size=min(len(batch_texts), Config.embedding_encode_batch),
             max_length=config.max_seq_len
         )
         all_embeddings.append(embeddings_np)
+        all_attention_masks.append(attention_mask)
 
     embeddings = np.concatenate(all_embeddings, axis=0)
-    masks = np.zeros((len(embeddings), config.max_seq_len), dtype=bool)
+    attention_masks = np.concatenate(all_attention_masks, axis=0)
+    key_padding_mask = (attention_masks == 0)
 
     shard_path = os.path.join(Config.shards_dir, f"shard_{shard_idx:05d}.npy")
     mask_path = os.path.join(Config.shards_dir, f"mask_{shard_idx:05d}.npy")
     np.save(shard_path, embeddings)
-    np.save(mask_path, masks)
+    np.save(mask_path, key_padding_mask)
     print(f"   💾 Шард {shard_idx}: {len(embeddings):,} примеров")
     return shard_path, mask_path
 
@@ -165,7 +181,6 @@ def process_parquet_streaming(parquet_path, config, engine, file_idx,
                                global_step):
     """
     Обрабатывает parquet-файл потоково: читает chunk → создаёт шард → обучает → удаляет.
-    Не хранит все шарды на диске одновременно.
     """
     import pyarrow.parquet as pq
 
@@ -195,15 +210,12 @@ def process_parquet_streaming(parquet_path, config, engine, file_idx,
         current_texts.extend(texts)
         rows_processed += len(texts)
 
-        # Когда накопили достаточно для шарда — обрабатываем сразу
         while len(current_texts) >= config.shard_size:
             shard_texts = current_texts[:config.shard_size]
             current_texts = current_texts[config.shard_size:]
 
-            # 1. Создаём шард
             shard_path, mask_path = _create_shard(shard_texts, config, engine, shard_idx)
 
-            # 2. Обучаем на шарде
             print(f"\n📚 Обучение на шарде {shard_idx}...")
             global_step = train_on_shard(
                 shard_path, mask_path, encoder, predictor, target_encoder,
@@ -211,7 +223,6 @@ def process_parquet_streaming(parquet_path, config, engine, file_idx,
                 global_step, shard_idx
             )
 
-            # 3. Сохраняем чекпоинт
             ckpt_path = os.path.join(Config.checkpoint_dir, f"jepa_shard_{shard_idx:05d}.pt")
             torch.save({
                 'context_encoder_state': encoder.state_dict(),
@@ -222,13 +233,19 @@ def process_parquet_streaming(parquet_path, config, engine, file_idx,
                 'mask_token': mask_token.data,
                 'global_step': global_step,
                 'shard_idx': shard_idx,
-                'input_dim': config.input_dim,
-                'embed_dim': config.embed_dim,
+                'model_config': {
+                    'input_dim': config.input_dim,
+                    'hidden_dim': config.hidden_dim,
+                    'embed_dim': config.embed_dim,
+                    'num_layers': config.num_layers,
+                    'nhead': config.nhead,
+                    'max_seq_len': config.max_seq_len,
+                    'dropout': config.dropout,
+                },
                 'model_name': config.model_path,
             }, ckpt_path)
             print(f"💾 [ЧЕКПОИНТ] Шард {shard_idx} → {ckpt_path}")
 
-            # 4. Удаляем шард
             try:
                 os.remove(shard_path)
                 os.remove(mask_path)
@@ -242,7 +259,6 @@ def process_parquet_streaming(parquet_path, config, engine, file_idx,
         if rows_processed % 50000 == 0:
             print(f"   📊 Прогресс: {rows_processed:,}/{total_rows:,} строк, {shards_trained} шардов обучено")
 
-    # Обрабатываем остаток
     if current_texts:
         shard_path, mask_path = _create_shard(current_texts, config, engine, shard_idx)
         print(f"\n📚 Обучение на финальном шарде {shard_idx}...")
@@ -262,8 +278,15 @@ def process_parquet_streaming(parquet_path, config, engine, file_idx,
             'mask_token': mask_token.data,
             'global_step': global_step,
             'shard_idx': shard_idx,
-            'input_dim': config.input_dim,
-            'embed_dim': config.embed_dim,
+            'model_config': {
+                'input_dim': config.input_dim,
+                'hidden_dim': config.hidden_dim,
+                'embed_dim': config.embed_dim,
+                'num_layers': config.num_layers,
+                'nhead': config.nhead,
+                'max_seq_len': config.max_seq_len,
+                'dropout': config.dropout,
+            },
             'model_name': config.model_path,
         }, ckpt_path)
         print(f"💾 [ЧЕКПОИНТ] Шард {shard_idx} → {ckpt_path}")
@@ -516,7 +539,6 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
         print(f"{'='*70}")
 
         if config.file_process_mode == "full":
-            # FULL MODE: потоковая обработка — шард за шардом
             global_step = process_parquet_streaming(
                 parquet_path, config, engine, file_idx,
                 encoder, predictor, target_encoder,
@@ -524,7 +546,6 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
                 global_step
             )
         else:
-            # FIXED MODE: как раньше, только первые N примеров
             shard_path, mask_path = precompute_shard_fixed(
                 parquet_path, config, engine, file_idx
             )
@@ -546,8 +567,15 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
                 'mask_token': mask_token.data,
                 'global_step': global_step,
                 'shard_idx': file_idx,
-                'input_dim': config.input_dim,
-                'embed_dim': config.embed_dim,
+                'model_config': {
+                    'input_dim': config.input_dim,
+                    'hidden_dim': config.hidden_dim,
+                    'embed_dim': config.embed_dim,
+                    'num_layers': config.num_layers,
+                    'nhead': config.nhead,
+                    'max_seq_len': config.max_seq_len,
+                    'dropout': config.dropout,
+                },
                 'model_name': config.model_path,
             }, ckpt_path)
             print(f"\n💾 [ЧЕКПОИНТ] Шард {file_idx} → {ckpt_path}")
