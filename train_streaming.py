@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from config import Config, DEVICE, get_amp_dtype, get_parquet_filenames
 from models import TextJEPAEncoder, JEPAPredictor
-from losses import VICRegLoss, compute_mask_indices, update_ema
+from losses import VICRegLoss, InfoNCELoss, compute_mask_indices, update_ema
 from dataset import ShardedEmbeddingsDataset
 
 
@@ -137,7 +137,6 @@ def precompute_shard_fixed(parquet_path, config, engine, shard_idx):
 
     embeddings = np.concatenate(all_embeddings, axis=0)
     attention_masks = np.concatenate(all_attention_masks, axis=0)
-    # key_padding_mask = True для padding (attention_mask == 0)
     key_padding_mask = (attention_masks == 0)
 
     np.save(shard_path, embeddings)
@@ -219,7 +218,7 @@ def process_parquet_streaming(parquet_path, config, engine, file_idx,
             print(f"\n📚 Обучение на шарде {shard_idx}...")
             global_step = train_on_shard(
                 shard_path, mask_path, encoder, predictor, target_encoder,
-                optimizer, scheduler, vicreg_loss, mask_token, config,
+                optimizer, scheduler, vicreg_loss, contrastive_loss, mask_token, config,
                 global_step, shard_idx
             )
 
@@ -264,7 +263,7 @@ def process_parquet_streaming(parquet_path, config, engine, file_idx,
         print(f"\n📚 Обучение на финальном шарде {shard_idx}...")
         global_step = train_on_shard(
             shard_path, mask_path, encoder, predictor, target_encoder,
-            optimizer, scheduler, vicreg_loss, mask_token, config,
+            optimizer, scheduler, vicreg_loss, contrastive_loss, mask_token, config,
             global_step, shard_idx
         )
 
@@ -307,7 +306,7 @@ def process_parquet_streaming(parquet_path, config, engine, file_idx,
 # ОБУЧЕНИЕ НА ШАРДЕ
 # ==========================================
 def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
-                   optimizer, scheduler, vicreg_loss, mask_token, config,
+                   optimizer, scheduler, vicreg_loss, contrastive_loss, mask_token, config,
                    global_step, shard_idx):
     """Обучает модель на одном шарде."""
     dataset = ShardedEmbeddingsDataset(shard_path, mask_path)
@@ -366,9 +365,9 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
 
         with autocast_ctx:
             with torch.no_grad():
-                target_repr, _ = target_encoder(x, key_padding_mask)
+                target_repr, pooled_tgt = target_encoder(x, key_padding_mask)
 
-            context_repr, _ = encoder(x_masked, key_padding_mask)
+            context_repr, pooled_ctx = encoder(x_masked, key_padding_mask)
             predicted_repr = predictor(context_repr, masked_indices)
 
             idx_expanded = masked_indices.unsqueeze(-1).expand(-1, -1, target_repr.size(-1))
@@ -380,6 +379,10 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
             total_loss, mse_loss, var_loss, cov_loss = vicreg_loss(
                 predicted_masked.float(), target_masked.float()
             )
+
+            # === InfoNCE: контрастивный loss на pooled representations ===
+            c_loss = contrastive_loss(pooled_ctx, pooled_tgt)
+            total_loss = total_loss + 0.5 * c_loss
 
         optimizer.zero_grad()
         total_loss.backward()
@@ -410,7 +413,8 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
 
             print(f"[Shard {shard_idx} | Step {global_step}] 📊 LR: {lr:.2e}")
             print(f"  ├─ 📉 Total={total_loss.item():.4f} | MSE={mse_loss.item():.4f} | "
-                  f"Var={var_loss.item():.4f} | Cov={cov_loss.item():.4f}")
+                  f"Var={var_loss.item():.4f} | Cov={cov_loss.item():.4f} | "
+                  f"InfoNCE={c_loss.item():.4f}")
             print(f"  ├─ ⚙️  Grad Norm={grad_norm.item():.3f} | Масок={mask_pct:.1f}%")
             print(f"  └─ ⏱  Шаг={step_time_acc/config.log_interval:.3f}s "
                   f"(Data={data_time_acc/config.log_interval:.3f}s){gpu_info}")
@@ -492,6 +496,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
     vicreg_loss = VICRegLoss(
         config.mse_weight, config.var_weight, config.cov_weight, config.vicreg_gamma
     )
+    contrastive_loss = InfoNCELoss(temperature=0.07)
 
     global_step = 0
     start_file_idx = 0
@@ -553,7 +558,7 @@ def streaming_train(config, num_files, examples_per_file, steps_per_shard, resum
             print(f"\n📚 Загрузка шарда {file_idx}...")
             global_step = train_on_shard(
                 shard_path, mask_path, encoder, predictor, target_encoder,
-                optimizer, scheduler, vicreg_loss, mask_token, config,
+                optimizer, scheduler, vicreg_loss, contrastive_loss, mask_token, config,
                 global_step, file_idx
             )
 
@@ -626,5 +631,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
