@@ -232,7 +232,14 @@ def get_amp_dtype():
     if Config.amp_dtype == "bfloat16":
         return torch.bfloat16
     elif Config.amp_dtype == "float16":
-        return torch.float16
+        # train_streaming.py не создаёт torch.cuda.amp.GradScaler, поэтому
+        # float16 здесь может привести к тихому underflow градиентов.
+        # Используйте bfloat16 (не требует scaler) или добавьте GradScaler
+        # в train_on_shard, прежде чем включать float16.
+        raise ValueError(
+            "amp_dtype='float16' небезопасен без GradScaler (см. train_on_shard "
+            "в train_streaming.py). Используйте 'bfloat16' или добавьте GradScaler."
+        )
     return torch.float32
 
 
@@ -265,4 +272,3 @@ def print_config():
 
 if __name__ == "__main__":
     print_config()
-

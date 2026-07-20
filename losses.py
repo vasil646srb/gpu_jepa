@@ -121,19 +121,46 @@ def compute_mask_indices(shape, key_padding_mask, num_mask_blocks, block_size_ra
     masked_indices = torch.zeros(batch_size, num_masked, dtype=torch.long, device=device)
     mask_bool = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=device)
 
-    for b in range(batch_size):
-        # Валидные позиции (не padding)
+    valid_lengths = (~key_padding_mask).sum(dim=1)  # [batch]
+
+    # --- Быстрый векторизованный путь --------------------------------
+    # Делим валидную область каждого примера на num_mask_blocks
+    # непересекающихся сегментов и берём случайный блок block_size
+    # внутри каждого сегмента. Это по построению исключает перекрытия
+    # блоков и не требует Python-цикла по батчу.
+    segment_len = torch.div(valid_lengths, num_mask_blocks, rounding_mode='floor')
+    can_vectorize = segment_len >= block_size  # [batch] bool
+
+    vec_idx = torch.where(can_vectorize)[0]
+    if len(vec_idx) > 0:
+        seg_len_v = segment_len[vec_idx]                      # [V]
+        max_start_v = (seg_len_v - block_size).clamp(min=0)   # [V]
+
+        rand = torch.rand(len(vec_idx), num_mask_blocks, device=device)
+        starts_in_segment = (rand * (max_start_v + 1).unsqueeze(1).float()).long()  # [V, num_blocks]
+
+        block_offsets = torch.arange(num_mask_blocks, device=device).unsqueeze(0) * seg_len_v.unsqueeze(1)
+        block_starts = block_offsets + starts_in_segment       # [V, num_blocks]
+
+        within_block = torch.arange(block_size, device=device).view(1, 1, -1)
+        idx = block_starts.unsqueeze(-1) + within_block        # [V, num_blocks, block_size]
+        idx = idx.reshape(len(vec_idx), -1).clamp(max=seq_len - 1)  # [V, num_masked]
+
+        masked_indices[vec_idx] = idx
+        mask_bool[vec_idx] = mask_bool[vec_idx].scatter(1, idx, True)
+
+    # --- Медленный путь только для коротких примеров (обычно редкость) --
+    fallback_idx = torch.where(~can_vectorize)[0]
+    for b in fallback_idx.tolist():
         valid_positions = torch.where(~key_padding_mask[b])[0]
 
         if len(valid_positions) <= num_masked:
-            # Если пример слишком короткий, повторяем позиции
             if len(valid_positions) == 0:
                 chosen = torch.zeros(num_masked, dtype=torch.long, device=device)
             else:
                 repeats = (num_masked // len(valid_positions)) + 1
                 chosen = valid_positions.repeat(repeats)[:num_masked]
         else:
-            # Выбираем num_mask_blocks случайных блоков (непересекающихся)
             chosen = []
             available = valid_positions.tolist()
 
@@ -147,13 +174,11 @@ def compute_mask_indices(shape, key_padding_mask, num_mask_blocks, block_size_ra
                 block = available[start_idx:start_idx + block_size]
                 chosen.extend(block)
 
-                # Удаляем использованные позиции + зазор в 1 токен (меньше перекрытие)
                 gap = 1
                 remove_start = max(0, start_idx - gap)
                 remove_end = min(len(available), start_idx + block_size + gap)
                 available = available[:remove_start] + available[remove_end:]
 
-            # Дополняем до num_masked если нужно
             if len(chosen) < num_masked:
                 chosen.extend([chosen[0]] * (num_masked - len(chosen)))
 
@@ -170,4 +195,3 @@ def update_ema(model, model_ema, tau):
     with torch.no_grad():
         for p, p_ema in zip(model.parameters(), model_ema.parameters()):
             p_ema.data.mul_(tau).add_(p.data, alpha=1 - tau)
-

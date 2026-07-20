@@ -387,7 +387,7 @@ def train_on_shard(shard_path, mask_path, encoder, predictor, target_encoder,
         optimizer.zero_grad()
         total_loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(encoder.parameters()) + list(predictor.parameters()),
+            list(encoder.parameters()) + list(predictor.parameters()) + [mask_token],
             config.max_grad_norm
         )
         optimizer.step()
@@ -631,4 +631,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
