@@ -15,17 +15,17 @@ echo "🔍 Проверка окружения..."
 python --version
 
 # ==========================================
-# 0.5. ФИКС NUMPY/PYARROW (контейнер 24.08 скомпилирован с numpy 1.x)
+# 0.5. ОБНОВЛЕНИЕ PYTORCH (требуется для Qwen3 и transformers>=4.51)
 # ==========================================
 echo ""
-echo "🔧 Фикс NumPy (даунгрейд до <2.0 для совместимости с PyTorch)..."
+echo "🔧 Обновление PyTorch до 2.6+ (требуется для Qwen3 / transformers>=4.51)..."
 
-CURRENT_NUMPY=$(python -c "import numpy; print(numpy.__version__)" 2>/dev/null || echo "none")
-echo "   Текущий NumPy: $CURRENT_NUMPY"
+pip install --no-cache-dir --upgrade "torch>=2.5.0" "torchvision" "torchaudio" --index-url https://download.pytorch.org/whl/cu124
 
-pip install --no-cache-dir "numpy<2.0" "pyarrow<16.2.0"
+# Убираем конфликтующий torch-tensorrt от NGC (не используется в проекте)
+pip uninstall -y torch-tensorrt 2>/dev/null || true
 
-echo "   ✅ NumPy/PyArrow зафиксированы на совместимых версиях"
+echo "   ✅ PyTorch обновлён"
 
 # ==========================================
 # 1. ОБНОВЛЕНИЕ PIP
@@ -40,22 +40,17 @@ pip install --no-cache-dir --upgrade pip setuptools wheel
 echo ""
 echo "📦 Установка зависимостей проекта..."
 
-# Основные пакеты (PyTorch/CUDA уже в контейнере nvcr.io)
-# ONNX Runtime больше НЕ ставится: текущий пайплайн (train_streaming.py, test_jepa.py)
-# использует чистый PyTorch-инференс через sentence-transformers, onnxruntime
-# нигде в коде не импортируется.
-pip install --no-cache-dir \
-    sentence-transformers \
-    transformers \
-    accelerate \
-    huggingface-hub \
-    scipy
+# Основные пакеты
+pip install --no-cache-dir --upgrade     transformers     sentence-transformers     accelerate     huggingface-hub     scipy     pyarrow
 
 # FlagEmbedding — опционально, нужен только если Config.embedding_backend
 # выставлен в "flag_m3" (или "auto" + имя модели содержит "bge-m3").
 # Код в train_streaming.py сам делает fallback на sentence-transformers,
 # если пакет отсутствует, поэтому падение установки не критично.
 pip install --no-cache-dir FlagEmbedding || echo "⚠️  FlagEmbedding не удалось установить, будет fallback на sentence-transformers"
+
+# optree — убирает FutureWarning от PyTorch 2.6
+pip install --no-cache-dir --upgrade "optree>=0.13.0" || echo "⚠️  optree не обновился, warning останется (не критично)"
 
 # ==========================================
 # 3. ПРОВЕРКА GPU И АРХИТЕКТУРЫ (Ampere/3090)
@@ -117,6 +112,13 @@ except ImportError:
 t = torch.tensor([1.0, 2.0, 3.0])
 arr = t.numpy()
 print(f'✅ torch->numpy OK: {arr}')
+
+# Проверка загрузки Qwen3
+print('')
+print('🧪 Тестовая загрузка Qwen/Qwen3-Embedding-0.6B...')
+from sentence_transformers import SentenceTransformer
+m = SentenceTransformer('Qwen/Qwen3-Embedding-0.6B', device='cuda', trust_remote_code=True)
+print(f'✅ Qwen3 загружен, dim={m.get_sentence_embedding_dimension()}')
 "
 
 # ==========================================
@@ -193,20 +195,21 @@ echo ""
 echo "📂 Рабочая директория: $WORKDIR"
 echo ""
 echo "💡 Рекомендации под RTX 3090 (24 GB VRAM):"
-echo "  - В config.py можно поднять TrainConfig.batch_size (напр. 128 → 256-384)"
-echo "  - TrainConfig.embedding_encode_batch тоже можно увеличить (напр. 64 → 128)"
-echo "  - amp_dtype='bfloat16' полностью поддерживается на Ampere, менять не нужно"
-echo "  - При увеличении batch_size соразмерно поднимите warmup_steps"
+echo "  - batch_size можно поднять до 512-1024 (в config.py)"
+echo "  - embedding_encode_batch можно увеличить до 256"
+echo "  - hidden_dim/embed_dim можно поднять до 768-1024"
+echo "  - num_layers можно увеличить до 10-12"
+echo "  - amp_dtype='bfloat16' полностью поддерживается на Ampere"
 echo ""
 echo "🚀 Команды для запуска:"
 echo ""
 echo "  cd $WORKDIR"
 echo ""
-echo "  # Обучение (по умолчанию: 10 файлов, 5000 примеров, 500 шагов/шард)"
+echo "  # Обучение (по умолчанию: 10 файлов, 10000 примеров/шард, 1000 шагов/шард)"
 echo "  python train_streaming.py"
 echo ""
 echo "  # Обучение с кастомными параметрами"
-echo "  python train_streaming.py --num-files 20 --examples-per-file 10000 --steps-per-shard 1000"
+echo "  python train_streaming.py --num-files 20 --steps-per-shard 1000 --mode full"
 echo ""
 echo "  # Возобновление обучения"
 echo "  python train_streaming.py --resume ./checkpoints/jepa_shard_009.pt"
@@ -225,3 +228,4 @@ echo "  - Для первого теста используйте --num-files 1 
 echo "  - Проверьте config.py перед запуском для настройки параметров"
 echo "  - Логи сохраняются в stdout (можно перенаправить: python train_streaming.py | tee train.log)"
 echo "=========================================="
+
