@@ -86,7 +86,8 @@ def load_jepa():
         dropout=config.dropout
     ).to(DEVICE)
 
-    ckpts = sorted(Path(Config.boss_checkpoint_dir).glob(Config.boss_checkpoint_pattern))
+    ckpt_dir = Path(Config.checkpoint_dir)
+    ckpts = sorted(ckpt_dir.glob("jepa_shard_*.pt"))
     if not ckpts:
         print("❌ Чекпоинты не найдены!"); sys.exit(1)
 

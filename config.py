@@ -44,12 +44,12 @@ else:
 class ModelConfig:
     """Архитектурные параметры JEPA."""
     input_dim = 1024
-    hidden_dim = 512
-    embed_dim = 512
+    hidden_dim = 768
+    embed_dim = 768
     num_layers = 8
     nhead = 8
-    max_seq_len = 128
-    dropout = 0.1
+    max_seq_len = 256
+    dropout = 0.15
 
 
 # ==========================================
@@ -57,10 +57,10 @@ class ModelConfig:
 # ==========================================
 class TrainConfig:
     """Параметры обучения."""
-    batch_size = 128
-    learning_rate = 3e-4
+    batch_size = 512
+    learning_rate = 1e-4
     total_steps = 50000
-    warmup_steps = 1000
+    warmup_steps = 300
     weight_decay = 1e-4
     max_grad_norm = 1.0
 
@@ -81,7 +81,7 @@ class TrainConfig:
     # Embedding engine
     embedding_backend = "auto"
     embedding_max_length = 256
-    embedding_encode_batch = 64
+    embedding_encode_batch = 256
 
     # Пути
     checkpoint_dir = "./checkpoints"

@@ -31,18 +31,18 @@ class PositionalEncoding(nn.Module):
 class TextJEPAEncoder(nn.Module):
     """
     Context/Target Encoder для Text-JEPA.
-    Преобразует последовательность эмбеддингов в скрытые представления.
-
-    Returns:
-        sequence_output: [batch, seq_len, embed_dim] - представления всех токенов
-        pooled_output: [batch, embed_dim] - усредненное представление (CLS-подобное)
+    Добавлен CLS-токен для агрегирования семантики (лучше чем mean-pooling).
+    Pooled output нормализуется L2 для контрастивного обучения.
     """
 
     def __init__(self, input_dim, hidden_dim, embed_dim, num_layers, nhead, max_seq_len, dropout=0.1):
         super().__init__()
 
         self.input_proj = nn.Linear(input_dim, hidden_dim)
-        self.pos_encoding = PositionalEncoding(hidden_dim, max_seq_len, dropout)
+        self.pos_encoding = PositionalEncoding(hidden_dim, max_seq_len + 1, dropout)  # +1 для CLS
+
+        # Learnable CLS token
+        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
@@ -65,25 +65,37 @@ class TextJEPAEncoder(nn.Module):
             key_padding_mask: [batch, seq_len] - True для padding токенов
 
         Returns:
-            sequence_output: [batch, seq_len, embed_dim]
-            pooled_output: [batch, embed_dim]
+            sequence_output: [batch, seq_len, embed_dim] (без CLS)
+            pooled_output: [batch, embed_dim] - нормализованный CLS
         """
+        batch_size = x.size(0)
+
         # Проекция и позиционное кодирование
         h = self.input_proj(x)
+
+        # Добавляем CLS token
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        h = torch.cat([cls_tokens, h], dim=1)  # [batch, seq_len+1, hidden]
+
+        # Расширяем key_padding_mask для CLS (CLS не является padding)
+        if key_padding_mask is not None:
+            cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=h.device)
+            key_padding_mask = torch.cat([cls_mask, key_padding_mask], dim=1)
+
         h = self.pos_encoding(h)
 
         # Transformer
         h = self.transformer(h, src_key_padding_mask=key_padding_mask)
 
         # Проекция в выходное пространство
-        sequence_output = self.layer_norm(self.output_proj(h))
+        h = self.output_proj(h)
+        h = self.layer_norm(h)
 
-        # Mean pooling (игнорируя padding)
-        if key_padding_mask is not None:
-            valid_mask = ~key_padding_mask.unsqueeze(-1)
-            pooled = (sequence_output * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
-        else:
-            pooled = sequence_output.mean(dim=1)
+        # CLS token для pooled (нормализованный)
+        pooled = F.normalize(h[:, 0], p=2, dim=-1)
+
+        # Остальные токены для sequence output (без CLS)
+        sequence_output = h[:, 1:]
 
         return sequence_output, pooled
 
@@ -126,7 +138,6 @@ class JEPAPredictor(nn.Module):
         embed_dim = context_repr.size(-1)
 
         # Извлекаем представления для замаскированных позиций через gather
-        # masked_indices: [batch, num_masked] -> [batch, num_masked, embed_dim]
         idx_expanded = masked_indices.unsqueeze(-1).expand(-1, -1, embed_dim)
         queries = context_repr.gather(1, idx_expanded)
 
